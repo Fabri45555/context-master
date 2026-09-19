@@ -1,0 +1,41 @@
+{
+  "project": {
+    "name": "context_master"
+  },
+  "triggers": {
+    "event_count": 40,
+    "token_threshold": 6000,
+    "interval_seconds": 300
+  },
+  "budget": {
+    "max_tokens_per_hour": 120000,
+    "max_cost_per_session_usd": 0.5
+  },
+  "privacy": {
+    "redact_secrets": true,
+    "local_only": false
+  },
+  "models": {
+    "tiers": {
+      "cheap": {
+        "provider": "ollama",
+        "model": "gpt-oss:120b-cloud",
+        "max_output_tokens": 8192,
+        "think": false
+      }
+    },
+    "routing": {
+      "classification": "cheap",
+      "extraction": "cheap",
+      "summarization": "cheap",
+      "conflict_resolution": "cheap",
+      "complex_reconciliation": "cheap"
+    }
+  },
+  "accounting": {
+    "agent_input_cost_per_mtok": 15
+  },
+  "limits": {
+    "worker_timeout_ms": 300000
+  }
+}

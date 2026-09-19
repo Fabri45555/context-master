@@ -1,0 +1,316 @@
+# contextd
+
+Continuous context manager for AI coding agents. Observes an agent's session, turns events
+into persistent structured project state, and serves back only the context that is relevant.
+Spec: [prd.md](prd.md) (amendments in its §61). Deviations from it:
+[docs/prd-review.md](docs/prd-review.md). Why it is not one of the existing OSS memory tools,
+and what was borrowed from them: [docs/landscape.md](docs/landscape.md).
+
+The one-line thesis: **the agent's context is disposable; the project's state is persistent.**
+
+## Project memory (read this first)
+
+This project runs its own tool on itself. A `contextd` MCP server holds persistent state across
+sessions, and using it is the point — a memory nothing ever queries is a cost with no return.
+
+- **Start of a session:** call `memory_bootstrap` before reading any file. It costs a few hundred
+  tokens and tells you the current task, the active constraints and the open issues.
+- **Before working on an area:** call `memory_query` with what you are about to do, rather than
+  re-deriving the context by reading source.
+- **When something durable is settled** — a decision and its reason, a constraint, a discovery that
+  cost time to find — call `memory_remember`. Leaving it in the conversation loses it.
+- `memory_explain` answers "why is this here"; `memory_conflicts` answers "does memory currently
+  contradict itself".
+
+If a query returns something wrong or stale, that is a finding about this project, not an
+inconvenience: say so and correct it.
+
+## Commands
+
+```bash
+npm test              # vitest
+npm run typecheck     # tsc --noEmit
+npm run build         # tsc -> dist/
+npm run dev -- <args> # run the CLI from source via tsx
+```
+
+Always run `npm test` and `npm run typecheck` before claiming a change works.
+
+## Layout
+
+| Path | What lives there |
+|---|---|
+| [src/core/](src/core/) | Pure logic, no I/O: event schema, patches, classification, redaction, budget |
+| [src/store/](src/store/) | SQLite: schema, the single writer, FTS5 retrieval |
+| [src/adapters/](src/adapters/) | Per-agent translation into normalized events |
+| [src/workers/](src/workers/) | Ephemeral LLM workers: prompt, providers, runner |
+| [src/daemon/](src/daemon/) | Ingest pipeline, state machine, the `ContextManager` facade |
+| [src/retrieval/](src/retrieval/) | Budget-aware context building |
+| [src/mcp/](src/mcp/) | MCP server — how an agent pulls context |
+| [src/ui/](src/ui/) | Read-only local dashboard (`contextd ui`) |
+| [src/cli/](src/cli/) | The `contextd` command |
+
+Memory has three levels: **L0** working memory (one row, small, always injected), **L1**
+memory items (the structured project state), **L2** raw events (audit and replay only, never
+prompted).
+
+## Invariants
+
+Breaking one of these breaks a PRD guarantee, so change them deliberately or not at all.
+
+1. **Deterministic first.** Every event passes [deterministic.ts](src/core/deterministic.ts)
+   and then [fold.ts](src/core/fold.ts) at ingest time. A model is called only for what is
+   left. Adding a model call to a path that can be decided by code is the main way to ruin
+   this project's economics.
+
+2. **Adapters may not assert importance they do not know.** `makeEvent` records whether
+   importance was a deliberate claim (`importance_source`). The classifier only yields to a
+   real claim. Treating the default as a claim silently disables all filtering — that bug
+   persisted 3,401 worthless events on the first real transcript.
+
+3. **The patch log is the source of truth.** `memory_items` is a materialization of it.
+   Never write to `memory_items` outside `ContextStore.commitPatch`, and keep
+   `contextd replay --verify` consistent — that command is the guard.
+
+4. **Ids are assigned before a patch is stored** (`normalizePatch`). Minting them during
+   apply makes replay produce different items and voids rollback and audit.
+
+5. **`processed_at` means "state was derived from this"**, not "we saw it". Only the fold or
+   a worker may set it.
+
+6. **User-critical memory is protected in code**, not by prompt. `isProtected` in
+   [patch.ts](src/core/patch.ts) rejects any patch that deletes or weakens a
+   `source: user` + `importance: critical` item. K2 targets ~0% loss of critical info; a
+   prompt instruction cannot deliver that.
+
+7. **Redact at ingest**, before anything reaches L2 or a provider — including values whose
+   *key* names a secret. Never redact only on egress.
+
+8. **A worker failure must never reach the agent.** Budget exhausted, provider down, patch
+   rejected twice: the events stay pending and the run returns `deferred`/`invalid`/`error`.
+   Deterministic maintenance keeps working.
+
+9. **Workers are single calls, never conversations.** One prompt, one patch, terminate. At
+   most one repair retry.
+
+10. **Code is not memory.** Store a path and its purpose; the repository stays the source of
+    truth for file contents.
+
+11. **The fold is conservative about project memory.** Harness errors, permission refusals, an
+    agent guessing at a path, a shell command that never parsed, and a dump rather than a
+    message are not project issues — see `isTransientToolError` and `looksLikeDump`. Filtering
+    these cut recorded issues from 36 to 4 real ones on a real session.
+
+12. **Every retirement path is guarded, not just `remove`.** `supersede`, and an `add` that
+    declares `supersedes`, retire an item as surely as deleting it. Guarding only `remove`
+    and `update` left K2 bypassable with one different key.
+
+13. **`isLive` means `status === 'active'`.** `stale` is what TTL decay assigns to stop an
+    item being served; treating it as live made `decay()` a no-op for keyword search and
+    graph traversal, because the SQL paths filtered on status and hid it.
+
+14. **Each worker task has its own prompt.** [tasks.ts](src/workers/tasks.ts) — they were
+    routed to different model tiers while sharing the extraction prompt, so a high tier paid
+    to do a job it was never told about. A task also declares what it *reads*
+    (`events` | `conflicts` | `memory`); reconciliation is not about new events at all.
+
+15. **Agents never appear in the CLI.** Where a transcript lives is declared by the adapter's
+    `surfaces`, not hardcoded in a command. `contextd surfaces` prints them; `contextd
+    doctor` verifies them.
+
+16. **Pressure is measured, never assumed.** The compaction ladder in
+    [lifecycle.ts](src/core/lifecycle.ts) reads the occupancy the agent reported for its last
+    turn, and an observed occupancy overrides an inferred window: a real session reported
+    `claude-opus-5` while holding 512,598 tokens, and trusting the model id put it at 256% of a
+    200k window, pinning the ladder at its most expensive rung. `window_source` says which
+    number was used.
+
+17. **Only the free rungs may run on the hook path.** `fold`, `decay` and `prune` are SQL and
+    stay inside the latency budget. Anything that needs a provider waits for
+    `contextd lifecycle --act` or the next cycle — see `needsProvider`.
+
+18. **"Resolved" is not "derived from".** An event that carried no derivable state is closed
+    with `markInert`, not `markProcessed`, and coverage excludes it from both sides of the ratio
+    (see the metrics note). Counting inert events as derived made 739 stored events with an
+    *empty* memory report 98.9% coverage — a discard rate dressed as compression.
+
+19. **The semantics gate is asymmetric.** A false negative loses the agent's reasoning
+    permanently; a false positive costs a few hundred tokens of the cheap tier. So an agent
+    message queues on a decision cue, a discovery cue, *or* mere substance
+    (`ASSISTANT_SUBSTANCE_CHARS`). Keyword-only matching dropped 102 of 106 agent messages on a
+    real session, including every finding in it — `contextd status` cannot show you that,
+    because a filter that never fires looks exactly like a quiet session.
+
+20. **A worker that recorded nothing derived nothing.** An empty patch closes its batch with
+    `markInert`, not `markProcessed` — otherwise a misconfigured model drains the queue, reports
+    `ok`, and drives coverage up while the memory stays empty. `emptyRunStreak` plus the
+    `worker output` check in `doctor` is what tells that apart from a quiet project.
+
+21. **`local_only` is a promise about the model, not about the daemon.** ollama runs on this
+    machine and proxies `*-cloud` models off it, so a constant `isLocal` let the gate pass while
+    every prompt left the machine. Use `providerIsLocal(provider, spec)`; a flag describing the
+    transport will eventually be wrong about the destination.
+
+22. **Session scaffolding is not the user speaking — but it quotes things that are.** A harness
+    *instruction line* is removed wherever it appears; a turn is dropped whole only when its
+    *opening* is harness framing. Scanning the whole text for framing markers did stop "do not
+    acknowledge the summary" becoming a protected constraint, and also threw away the project's
+    original goal, which existed only as a quotation inside that same summary.
+    `stripHarnessScaffolding` excises tagged
+    blocks wherever they appear and drops harness preambles whole; a cue found inside pasted
+    terminal output never promotes a message to `critical`. A real extraction turned "do not
+    acknowledge the summary, do not recap" into a `source: user` + `critical` constraint, which
+    `isProtected` then made permanent. There are three sites that emit `USER_MESSAGE` — all
+    three must strip.
+
+23. **A worker may not assert certainty it cannot have.** `normalizePatch` clamps inferred
+    confidence to `MAX_INFERRED_CONFIDENCE`; 1.0 is for what the user said in so many words. A
+    real run returned 18 items at 1.00, which makes the field carry no information and stops
+    `min_bootstrap_confidence` from ever firing.
+
+24. **A provable no-op is dropped, not a reason to reject everything.** `pruneInertOperations`
+    removes `remove`/`link`/`unlink`/`touch` whose target exists nowhere, records the drop in the
+    patch note, and leaves `update` and `supersede` alone — a mistyped `update` target means real
+    intent. A real run lost 45 events of good extraction because the model invented three link
+    targets, one of them a file path. A user's own patch still gets the error.
+
+25. **One bad entry does not sink the batch — but losing the whole operation is not a salvage.**
+    `parsePatch` drops the individual array entries a schema failure blames and re-parses,
+    recording *which field failed* per entry in the patch note. It salvages nothing when the
+    failure is elsewhere, when the result would be empty, or when every entry of an operation was
+    dropped: that last case once applied a patch containing only its `working` block, reported
+    `ok`, consumed 58 events and stored zero items — the invariant-20 failure arriving through the
+    salvage path. A real run lost 48 events and 22
+    correct items because item 23 of 23 lacked `text`. The same shape of fix as
+    `pruneInertOperations` — and the third time all-or-nothing handling of a mostly-good model
+    output turned out to be the expensive choice.
+
+26. **A worker must be able to *prove* a user attribution.** `source: user` + `critical` is the one
+    combination `isProtected` makes permanent, so `verifyUserProvenance` downgrades any such item
+    whose `evidence` does not cite a real `USER_MESSAGE` event. The text survives, the attribution
+    does not. On a live session the worker synthesised a goal from the conversation — including a
+    detail the *agent* had proposed — and filed it as a permanently protected user instruction.
+
+27. **An error belongs to the call that produced it.** A tool error arrives as `ERROR_DETECTED`
+    carrying only `tool_use_id`; the command is on the matching `TOOL_CALL`. The fold correlates
+    them, so a failed throwaway one-liner (`isScratchCommand`) is inert while a failed `npm run
+    build` is still a known issue. Without the correlation the two are indistinguishable.
+
+28. **A measurement is not memory.** The sibling of invariant 10: test counts, percentages,
+    token totals and timings move every run, so a stored number is false as soon as it changes.
+    A live extraction recorded "coverage = 93.2%" and "194-198 tests" as completed work, both
+    already wrong when written. Record that the measurement exists; `contextd status` is where its
+    value lives.
+
+29. **Never recover structured data by re-parsing your own output.** `finish` scraped the rendered
+    context for `[mem_...]` to learn which items it had served. Workers began assigning short ids
+    (`d3`) — because the prompt asked them to — and the regex silently matched nothing, so
+    `markUsed` got an empty list and `never_retrieved` was pinned at 100% however much was
+    retrieved. Sections carry their `itemIds` through instead.
+
+30. **Measuring is not serving.** `bootstrapContext()` measures the always-on slice for status,
+    pressure and the dashboard and logs nothing; `serveBootstrap()` is what the SessionStart hook
+    and `memory_bootstrap` call, and it counts as a retrieval. Counting only queries left every
+    always-on item looking never-retrieved; counting the measurement would let `status` move the
+    number it reports. Same for the dashboard's query preview (`record: false`).
+
+31. **Every memory category has a place.** `BOOTSTRAP_SECTIONS` plus `QUERY_ONLY_CATEGORIES` must
+    cover `MEMORY_CATEGORIES` exactly — a test enforces it. `goals` and then `requirements` were
+    extracted correctly and served to no session, because no section named them.
+
+32. **Occupancy comes from the transcript, not the hook payload.** Claude hook payloads carry no
+    usage, so on a hook-only install the ladder read the pre-compaction peak forever and sat at
+    `reduce` with the window half empty. `Stop` reads the last turn's usage via the adapter's
+    `usageSource`; usage rows are keyed by message id so hook and transcript count a turn once. A
+    compaction request stays live only until the agent reports another turn.
+
+33. **`Stop` is the end of a turn, not of a task.** It emits no event. As `TASK_COMPLETED` it
+    would have the fold mark the working task done after every reply.
+
+34. **Absent is absent, however it is spelled.** Adapter helpers return `null`; the payload schema
+    takes `undefined`. `makeEvent` strips nulls. The mismatch made every Claude `Stop` hook throw
+    for as long as it was installed — silently, because a hook must never fail the agent.
+
+35. **A verbatim re-add is a provable no-op** (the invariant-24 family). `pruneInertOperations`
+    drops an `add` whose text matches an active item in the same category and aliases its id to
+    the original so links still land; a patch left empty closes its batch as inert, not `invalid`.
+    A pasted `contextd memory` listing was re-extracted into seven duplicates: the memory quoting
+    itself back into the queue.
+
+36. **Wrong memory has to be correctable.** `contextd forget` / `memory_retire` retire with a
+    reason; `remember --supersedes` replaces. The project instructions tell the agent to correct
+    stale memory, and until these existed nothing short of `reset` could.
+
+## Conventions
+
+- TypeScript, ESM, Node 22+, `strict` plus `noUncheckedIndexedAccess`. Relative imports
+  carry the `.js` extension.
+- Zod schemas are the contract at every boundary (config, events, patches, memory items).
+- Tests live in [tests/](tests/) and use scripted providers — a test must never hit a
+  network or a real model.
+- Comments explain *why*, especially where a choice looks odd. Do not add comments that
+  restate the code.
+- When a bug is found by running against real data, add the regression test that would have
+  caught it.
+
+## Verifying against real data
+
+The test suite uses synthetic fixtures; it has missed real bugs that a real transcript
+caught immediately. For a behavioural change, also run:
+
+```bash
+node dist/cli/index.js init --no-hooks
+node dist/cli/index.js attach --adapter claude --transcript <a real .jsonl> --no-worker
+node dist/cli/index.js status
+node dist/cli/index.js memory        # is what was recorded actually worth keeping?
+node dist/cli/index.js replay --verify
+```
+
+Claude Code transcripts are in `~/.claude/projects/<slugged-cwd>/*.jsonl`; Codex rollouts in
+`~/.codex/sessions/<y>/<m>/<d>/*.jsonl`.
+
+## Note on metrics
+
+K1 is reported as three numbers, not one: `token_reduction` (the cheap ratio), `coverage` and
+`effective_reduction` (their product). Quote the third. A high ratio with low coverage is a
+backlog, not compression.
+
+**Coverage is `derived / (derived + pending)`** — of the events that could ever have produced
+state, how many have. It took three definitions to get right, each wrong in a way this codebase
+keeps repeating:
+
+| Definition | What it got wrong |
+|---|---|
+| `derived / stored` | inert events counted as derived → 98.9% on an *empty* memory |
+| `(stored − pending − inert) / stored` | punished discarding worthless events → 18.9% with nothing outstanding |
+| `derived / (derived + pending)` | current: inert events were never candidates, so they neither help nor hurt |
+
+`derived === 0` pins coverage at zero regardless, because a worker returning empty patches closes
+its batches as inert — without that, a broken model reads 100% against an empty memory.
+
+`precision` answers the question PRD 29 does not: whether the memory we keep is worth
+keeping. `never_retrieved_ratio` is the signal to watch — a true fact nobody ever needed is
+still a cost.
+
+`hard_compactions` is how this project scores itself: it counts the times the agent compacted
+anyway, which is the ladder failing. `recovery_ready` asks K5 before the fact — if the agent
+compacted right now, is there enough derived state to continue from?
+
+The hook path has an explicit latency budget (`limits.hook_latency_ms`, default 250ms)
+because it is synchronous for the agent. Measured p50 on a real session is ~9ms.
+
+## Optional layers
+
+These are off or empty unless used, and nothing depends on them:
+
+- **Graph** ([graph.ts](src/core/graph.ts)) — typed relations, emitted by workers as `link`
+  in a patch. Retrieval walks one hop out from its best hits, so a constraint that governs a
+  decision is reachable even when its text shares nothing with the query.
+- **Embeddings** ([embeddings.ts](src/store/embeddings.ts)) — disabled by default, local
+  provider by default. Fused with BM25 by reciprocal rank, because the two scores are not on
+  a comparable scale. A vector database is still not justified at this size: the cosine scan
+  is exhaustive and fast.
+- **Conflicts** ([conflicts.ts](src/core/conflicts.ts)) — detection is deterministic and
+  free; a model is spent only on deciding which side wins. Comparison crosses category
+  boundaries for pairs like constraints/decisions, which is where the K2-relevant conflicts
+  actually live.

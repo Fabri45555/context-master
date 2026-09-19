@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.context/
+*.log
+.DS_Store
+coverage/
+
+# machine-local: hooks written by `contextd init` carry absolute paths
+.claude/
+# browser-automation scratch output
+.playwright-mcp/
