@@ -18,18 +18,28 @@
   "models": {
     "tiers": {
       "cheap": {
-        "provider": "ollama",
-        "model": "gpt-oss:120b-cloud",
-        "max_output_tokens": 8192,
-        "think": false
+        "provider": "claude-code",
+        "model": "haiku",
+        "max_output_tokens": 8192
+      },
+      "medium": {
+        "provider": "claude-code",
+        "model": "sonnet",
+        "max_output_tokens": 8192
+      },
+      "high": {
+        "provider": "claude-code",
+        "model": "opus",
+        "max_output_tokens": 8192
       }
     },
     "routing": {
       "classification": "cheap",
       "extraction": "cheap",
       "summarization": "cheap",
-      "conflict_resolution": "cheap",
-      "complex_reconciliation": "cheap"
+      "conflict_resolution": "medium",
+      "complex_reconciliation": "medium",
+      "learn": "medium"
     }
   },
   "accounting": {

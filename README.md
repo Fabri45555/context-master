@@ -399,6 +399,31 @@ shell is refused:
 contextd forget mem_0mucgeiti1db922250a --reason "duplicate of mem_0mucgeift9687811391" --protected
 ```
 
+### Knowing when to /clear
+
+contextd does not trim the agent's window — cutting it turn by turn would throw away the prompt
+cache — but it tells you when throwing the whole conversation away has become safe. Once the agent
+is past `lifecycle.pressure_high` (75%) and memory can carry the session, the next prompt shows,
+to you and never to the model:
+
+```
+contextd: context at 80% and project memory is up to date - /clear now and the next session
+starts from the 684-token bootstrap.
+```
+
+If memory is not ready yet, it says what to run first (`contextd compact`). It is said once per
+level per session. The same state is in the dashboard's Overview and, if you want it always in
+view, in Claude Code's status line:
+
+```bash
+contextd statusline install           # .claude/settings.local.json: personal, not committed
+contextd statusline install --chain   # keep the status line you already have, append contextd's
+contextd statusline uninstall         # and a chained line of yours goes back where it was
+```
+
+It reads `contextd · ctx 80% · memory ready: /clear is safe`, or `ctx 34% · 47 items` when there
+is nothing to do. `contextd init --statusline` installs it during setup.
+
 ### Keeping the current task current
 
 The **Current task** at the top of every bootstrap is working memory, normally written by workers.
@@ -556,7 +581,7 @@ contextd projects clear --yes       # empty it; projects come back on their next
 
 | Command | Purpose | Notable flags |
 |---|---|---|
-| `init` | Write config, install agent hooks | `--agent`, `--global`, `--no-hooks`, `--mcp [scope]` |
+| `init` | Write config, install agent hooks | `--agent`, `--global`, `--no-hooks`, `--mcp [scope]`, `--statusline` |
 | `doctor` | Check ingestion, providers, budgets and the patch log | |
 | `surfaces` | How each supported agent can be ingested from | |
 | `attach` | Follow a session transcript | `--adapter`, `--transcript`, `--watch`, `--interval`, `--from-start`, `--no-worker` |
@@ -569,6 +594,7 @@ contextd projects clear --yes       # empty it; projects come back on their next
 | `mirror` | Write the bootstrap into an instruction file | `--target claude-local\|agents\|cursor\|gemini\|<path>`, `--budget`, `--check` |
 | `learn` | Turn failure → success episodes into lessons, with a model | `--session`, `--all`, `--dry-run` |
 | `projects` | The registry behind `status --all`: list, add, remove, prune, clear | `--dry-run`, `--yes` |
+| `statusline` | Print the status-line segment (what the agent runs); `install` / `uninstall` it | `--chain`, `--adapter`, `--no-color` |
 | `status` | Metrics: events, memory, reduction, cost, pressure, precision | `--session`, `--json`, `--all` |
 | `memory` | List persistent memory | `--category`, `--all`, `--json` |
 | `context [query]` | Build the context an agent should receive | `--limit`, `--category`, `--json` |
@@ -725,8 +751,28 @@ Tasks are routed per tier, and each has its own prompt:
 | `classification` | existing memory | cheap |
 | `conflict_resolution` | detected contradiction pairs | medium |
 | `complex_reconciliation` | the whole memory | high |
+| `learn` | failure → success episodes | medium |
 
-Providers: `anthropic`, `openai`, `ollama`, and `noop` for deterministic-only operation.
+Providers: `claude-code`, `anthropic`, `openai`, `ollama`, and `noop` for deterministic-only operation.
+
+### Claude Code as the model
+
+If you use Claude Code, the workers can run on it — your Claude login, no API key:
+
+```json
+"models": {
+  "tiers": {
+    "cheap":  { "provider": "claude-code", "model": "haiku" },
+    "medium": { "provider": "claude-code", "model": "sonnet" },
+    "high":   { "provider": "claude-code", "model": "opus" }
+  }
+}
+```
+
+Each worker call is one `claude -p` with no tools, in an empty temporary directory, with
+`--safe-mode` (no hooks, no CLAUDE.md, no plugins, no MCP servers) and no saved session, so it can
+never be recorded as your own work. `CONTEXTD_CLAUDE_BIN` points at the CLI if it is not on PATH;
+`contextd doctor` checks it. Calls count against your plan's usage like any other Claude Code use.
 
 ### A local model
 

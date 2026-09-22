@@ -19,7 +19,7 @@ export const WORKER_TASKS = [
 export const WorkerTaskSchema = z.enum(WORKER_TASKS);
 export type WorkerTask = z.infer<typeof WorkerTaskSchema>;
 
-export const ProviderSchema = z.enum(['anthropic', 'openai', 'ollama', 'noop']);
+export const ProviderSchema = z.enum(['anthropic', 'openai', 'ollama', 'claude-code', 'noop']);
 export type ProviderName = z.infer<typeof ProviderSchema>;
 
 export const ModelSpecSchema = z.object({
@@ -212,6 +212,19 @@ export const ConfigSchema = z.object({
        * contextd should not start editing a file the user reads because a hook fired.
        */
       refresh_on_maintenance: z.boolean().default(false),
+    })
+    .default({}),
+
+  /**
+   * `contextd statusline`. `chain` is a status-line command the person already had: it runs first,
+   * with the same payload, and contextd's segment is appended - so installing contextd's never
+   * costs someone the line they had (`statusline install --chain`).
+   */
+  statusline: z
+    .object({
+      chain: z.string().nullable().default(null),
+      /** The settings file `chain` was read from, so uninstalling puts it back exactly there. */
+      chain_from: z.string().nullable().default(null),
     })
     .default({}),
 

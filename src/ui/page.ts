@@ -236,6 +236,10 @@ export function renderPage(version = '', appVersion = ''): string {
   .rows.fixed .side { width: 220px; }
   .rows.patches .side { width: 250px; }
   .rows.reqs .side { width: 300px; justify-content: flex-end; }
+  .advice { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 11px 14px; margin-bottom: 14px;
+            border: 1px solid var(--line); border-left-width: 3px; border-radius: var(--r); background: var(--surface); font-size: 13px; }
+  .advice.good { border-left-color: var(--good); } .advice.good b { color: var(--good); }
+  .advice.warn { border-left-color: var(--warn); } .advice.warn b { color: var(--warn); }
   .rows.reqs .kind { width: 64px; display: inline-flex; justify-content: center; }
   .rows.reqs .tok { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; }
   .rows.reqs .tok small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; line-height: 1.1; }
@@ -607,7 +611,14 @@ async function drawOverview() {
   }
   const pw = projectMark(session);
 
-  let html = '<div class="kpis">';
+  // When the window is filling, the one actionable thing on the page goes first.
+  const ca = d.clear_advice;
+  let html = ca
+    ? '<div class="advice ' + (ca.ready ? 'good' : 'warn') + '" role="status"><b>' +
+      (ca.ready ? 'Safe to /clear' : 'Not safe to /clear yet') + '</b><span>' +
+      esc(ca.text.replace(/^contextd: /, '')) + '</span></div>'
+    : '';
+  html += '<div class="kpis">';
   html += r.smaller_by != null
     ? kpi('Resume size', times(r.smaller_by) + '<small>smaller</small>',
         num(r.bootstrap_tokens) + ' tokens vs a ' + compact(r.agent_peak_tokens) + ' peak' + (session ? ' in this session' : ''), 'good',
@@ -703,6 +714,8 @@ async function drawOverview() {
       ['Window', esc(p.window_source)],
       ['Authorised now', p.actions.length ? esc(p.actions.join(', ')) : '<small>nothing</small>'],
       ['Recovery (K5)', p.recovery_ready ? 'ready' : 'not ready', p.recovery_ready ? 'good-t' : 'bad-t', p.recovery_blockers.join('; ')],
+      ['Safe to /clear', !ca ? '<small>not needed yet</small>' : ca.ready ? 'yes' : 'not yet', ca ? (ca.ready ? 'good-t' : 'warn-t') : '',
+        'advised once occupancy passes lifecycle.pressure_high, when memory is ready to resume from'],
       ['Hard compactions', num(m.lifecycle.hard_compactions), m.lifecycle.hard_compactions ? 'warn-t' : ''],
     ]), '<span title="' + esc(p.reasons.join(', ')) + '">' + esc(p.reasons.join(', ').replace(/_/g, ' ')) + '</span>');
 

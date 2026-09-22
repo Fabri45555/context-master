@@ -1,5 +1,5 @@
-import { accessSync, constants } from 'node:fs';
-import { relative } from 'node:path';
+import { accessSync, constants, existsSync } from 'node:fs';
+import { delimiter, isAbsolute, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ADAPTERS,
@@ -433,6 +433,12 @@ function pullChecks(manager: ContextManager, wiring: Wiring, days: number): Chec
   ];
 }
 
+/** Stat only: whether a command name resolves on PATH, or an absolute path exists. */
+function onPath(bin: string): boolean {
+  if (isAbsolute(bin)) return existsSync(bin);
+  return (process.env.PATH ?? '').split(delimiter).some((dir) => dir && existsSync(join(dir, bin)));
+}
+
 function providerChecks(config: Config): Check[] {
   const out: Check[] = [];
   const seen = new Set<string>();
@@ -461,6 +467,22 @@ function providerChecks(config: Config): Check[] {
           : 'local_only is set but this provider is remote; workers will never run',
         fix: 'point this tier at a local model or noop, or unset privacy.local_only',
       });
+      continue;
+    }
+
+    // Claude Code as the model needs its CLI, not a key: the person's own login is the credential.
+    if (spec.provider === 'claude-code') {
+      const bin = spec.base_url ?? process.env.CONTEXTD_CLAUDE_BIN ?? 'claude';
+      if (!onPath(bin)) {
+        out.push({
+          name: `provider ${key}`,
+          status: 'warn',
+          detail: `\`${bin}\` is not on PATH; workers will fail and events will stay queued`,
+          fix: 'install Claude Code, or set CONTEXTD_CLAUDE_BIN to its path',
+        });
+        continue;
+      }
+      out.push({ name: `provider ${key}`, status: 'ok', detail: `Claude Code CLI (\`${bin} -p\`), on your Claude login` });
       continue;
     }
 

@@ -7,6 +7,8 @@ import {
   needsProvider,
   type LifecycleAction,
   type PressureAssessment,
+  clearAdvice,
+  type ClearAdvice,
 } from '../core/lifecycle.js';
 import { detectConflicts, type Conflict } from '../core/conflicts.js';
 import { estimateTokens } from '../core/events.js';
@@ -510,6 +512,27 @@ export class ContextManager {
       stateVersion: this.store.stateVersion(),
       bootstrapTokens: this.bootstrapContext().tokens,
     });
+  }
+
+  /** Whether to tell the person the context can be cleared now (see `clearAdvice`). Reads only. */
+  clearAdviceNow(sessionId: string | null): ClearAdvice | null {
+    const p = this.pressure(sessionId);
+    return clearAdvice(this.config, p, this.bootstrapContext().tokens);
+  }
+
+  /**
+   * The same, said at most once per level per session: a notice on every prompt would be noise the
+   * person learns to ignore. A move from "high" to "critical", or from "not ready" to "ready", is
+   * news and is said again.
+   */
+  clearAdviceOnce(sessionId: string): ClearAdvice | null {
+    const advice = this.clearAdviceNow(sessionId);
+    if (!advice) return null;
+    const key = `clear_advice:${sessionId}`;
+    const said = `${advice.level}:${advice.ready ? 'ready' : 'blocked'}`;
+    if (getMeta(this.store.db, key) === said) return null;
+    setMeta(this.store.db, key, said);
+    return advice;
   }
 
   /** How many times the agent compacted anyway - the ladder's failure count. */

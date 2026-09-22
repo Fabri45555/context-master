@@ -346,6 +346,26 @@ Breaking one of these breaks a PRD guarantee, so change them deliberately or not
     opening a manager creates storage and a stray command in the wrong directory must not list it
     forever. `contextd projects` removes, prunes and clears entries; none of them touch memory.
 
+62. **Advice about the context goes to the person, never into it.** contextd cannot clear the
+    agent's window and should not trim it turn by turn (that defeats the prompt cache); it says
+    when `/clear` is safe. `clearAdvice` keys on measured occupancy past `pressure_high`, never on
+    a stage a backlog alone raised, and says "not yet" with what to run when memory could not carry
+    the session. The hook returns it as the adapter's person-only channel (Claude's
+    `systemMessage`), once per level per session (`clearAdviceOnce`); the dashboard and status line
+    only read it.
+
+63. **A status line someone had is never lost.** `statusline install` writes the personal
+    `.claude/settings.local.json`, never the committed settings. An existing line is a conflict;
+    `--chain` runs it first with the same payload, records it in the project's own config (never
+    quoted into settings.json) and `uninstall` puts it back in the file it came from. Rendering is
+    silent on every failure, bounded to a second for the chained command, and creates no storage.
+
+64. **A worker on Claude Code is not a session.** The `claude-code` provider runs `claude -p` with
+    `--safe-mode` (no hooks, CLAUDE.md, plugins or MCP), `--tools ""`, no saved session and an
+    empty temp directory, and sets `CONTEXTD_WORKER=1`, on which `contextd hook` exits at once.
+    Without these the worker's own session would be ingested as the person's work. Not `--bare`:
+    it never reads OAuth, so it needs the API key this provider exists to do without.
+
 ## Metrics, in full
 
 K1 is reported as three numbers, not one: `token_reduction` (the cheap ratio), `coverage` and

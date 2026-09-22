@@ -124,6 +124,9 @@ one are in [docs/invariants.md](docs/invariants.md) — read the entry before ch
 59. **A mirror fits its reader's budget by dropping items,** never by cutting text.
 60. **A stale build is a warning, found by stat alone** (`drift.ts`).
 61. **A project registers itself only on evidence of use;** `contextd projects` cleans the registry, never memory.
+62. **Advice about the context goes to the person, never into it** (`clearAdvice`, `systemMessage`), once per level.
+63. **A status line someone had is never lost:** settings.local.json only; `--chain` keeps it, uninstall restores it.
+64. **A worker on Claude Code is not a session:** `--safe-mode`, no tools, `CONTEXTD_WORKER=1` makes the hook exit.
 
 ## Conventions
 

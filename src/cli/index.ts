@@ -20,10 +20,13 @@ import {
   preferredSurface,
   realHost,
   sessionIdFromFilename,
+  type Adapter,
+  type HookReply,
   type McpChange,
 } from '../adapters/index.js';
 import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/state.js';
 import { isOurHookCommand, launchString, selfLaunch } from '../ops/self.js';
+import { formatStatusline, joinStatusline, readStatusline, runChained } from '../ops/statusline.js';
 import { entryIsLive, filterRegistry, registerProject, readRegistry, registryPath, unregisterProject } from '../ops/registry.js';
 import { dbPath } from '../store/db.js';
 import { mcpInstall, mcpStatus, mcpUninstall, purge, purgeTargets, uninstallWiring } from '../ops/install.js';
@@ -112,6 +115,7 @@ program
   .option('--global', 'install hooks in the user-level settings instead of the project', false)
   .option('--no-hooks', 'write the config only')
   .option('--mcp [scope]', 'also register the MCP server for this agent (default scope: the adapter\'s)')
+  .option('--statusline', "also show context use and when /clear is safe in the agent's status line", false)
   .action((opts, cmd) => {
     const cwd = resolve((cmd.optsWithGlobals().cwd as string) ?? process.cwd());
     const existing = findConfigFile(cwd);
@@ -178,6 +182,13 @@ program
     } else if (adapter.mcp) {
       out(`to let ${adapter.agent} query memory: contextd mcp install --adapter ${adapter.name}`);
     }
+
+    if (opts.statusline === true && adapter.statusline) {
+      const r = adapter.statusline.install(host, `${launchString(selfLaunch())} statusline`);
+      out(`status line: ${r.status} - ${r.detail}`);
+    } else if (adapter.statusline) {
+      out(`to see context use and when /clear is safe in the status line: contextd statusline install`);
+    }
   });
 
 /** Record the project in the user-level registry for `status --all`. Never fails the caller. */
@@ -208,6 +219,9 @@ program
   .action(async (opts, cmd) => {
     // Hooks run on the agent's critical path. Ingest, return, never block on a provider
     // (PRD 31) - and never fail the agent because of us (PRD 35).
+    // A contextd worker running on Claude Code is itself a Claude session; its hooks must not
+    // record it as the person's work (the claude-code provider sets this).
+    if (process.env.CONTEXTD_WORKER) return;
     let m: ContextManager | null = null;
     const started = performance.now();
     try {
@@ -229,24 +243,26 @@ program
         await m.runLifecycle(sessionId, { deterministicOnly: true });
       }
 
-      // SessionStart is the one hook where returning context is useful: it becomes the
-      // agent's starting brief, which is exactly PRD 21's bootstrap injection.
-      if (payload.hook_event_name === 'SessionStart') {
+      // What the hook says back, and how, is the adapter's business (invariant 15).
+      const adapter = getAdapter(opts.adapter as string);
+      const moment = adapter.hookMoment?.(payload) ?? 'other';
+      let reply: HookReply | null = null;
+      if (moment === 'session_start') {
         // Projects set up before the registry existed appear in `status --all` from their next
         // session. Once per session, and a no-op read when the entry is already current.
         noteProject(m);
+        // The one hook where returning context is useful: it becomes the agent's starting brief,
+        // which is exactly PRD 21's bootstrap injection.
         const built = m.serveBootstrap(sessionId);
-        if (built.text.length > 0) {
-          out(
-            JSON.stringify({
-              hookSpecificOutput: {
-                hookEventName: 'SessionStart',
-                additionalContext: `# Persistent project memory (contextd)\n\n${built.text}`,
-              },
-            }),
-          );
-        }
+        if (built.text.length > 0) reply = { context: `# Persistent project memory (contextd)\n\n${built.text}` };
+      } else if (moment === 'user_prompt') {
+        // The ladder keeps memory ready; this says when throwing the conversation away has become
+        // safe, to the person, before the agent hits its limit and compacts on its own.
+        const advice = m.clearAdviceOnce(sessionId);
+        if (advice) reply = { notice: advice.text };
       }
+      const printed = reply ? adapter.hookReply?.(moment, reply) : null;
+      if (printed) out(printed);
     } catch (err) {
       process.stderr.write(`contextd hook: ${(err as Error).message}\n`);
     } finally {
@@ -1396,7 +1412,16 @@ program
     for (const h of report.hooks) out(`${h.adapter}: removed hooks (${h.events.join(', ')}) from ${h.path}`);
     for (const { adapter, change } of report.mcp) printMcpChange(adapter, change);
     for (const mm of report.mirrors) out(`mirror: ${mm.result === 'deleted' ? 'deleted' : 'removed the block from'} ${mm.path}`);
-    if (report.hooks.length + report.mcp.length + report.mirrors.length === 0) out('no contextd wiring found');
+    let statuslines = 0;
+    const chained = chainOf(root);
+    for (const adapter of Object.values(ADAPTERS)) {
+      for (const path of adapter.statusline?.uninstall(realHost(root), isOurStatusline, chained) ?? []) {
+        out(`${adapter.name}: removed the status line from ${path}${chained && chained.path === path ? ' (yours is back)' : ''}`);
+        statuslines += 1;
+      }
+    }
+    if (chained && doomed.length === 0) setStatuslineChain(root, null);
+    if (report.hooks.length + report.mcp.length + report.mirrors.length + statuslines === 0) out('no contextd wiring found');
 
     if (doomed.length > 0) {
       purge(doomed);
@@ -1551,6 +1576,99 @@ program
   });
 
 // ------------------------------------------------------------------ doctor
+
+// ------------------------------------------------------------- statusline
+
+/** A status-line command is ours when it runs contextd's `statusline` and nothing else. */
+function isOurStatusline(command: string): boolean {
+  return /(^|\s|\/)(contextd|index\.js)\s+statusline\s*$/.test(command.trim());
+}
+
+/**
+ * Record (or forget) the status line `--chain` took over, in the project's own config file - the
+ * one file here that is contextd's to edit. Quoting someone's command into settings.json instead
+ * would be one shell-escaping bug away from breaking their prompt.
+ */
+function setStatuslineChain(root: string, chain: { path: string; command: string } | null): void {
+  const path = findConfigFile(root) ?? join(root, CONFIG_FILENAMES[0]!);
+  const current = existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>) : {};
+  const next = { ...current };
+  if (chain) next.statusline = { chain: chain.command, chain_from: chain.path };
+  else delete next.statusline;
+  writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+}
+
+function chainOf(root: string): { path: string; command: string } | null {
+  const s = loadConfig(root).config.statusline;
+  return s.chain && s.chain_from ? { path: s.chain_from, command: s.chain } : null;
+}
+
+function statuslineAdapter(name: string | undefined): Adapter {
+  const adapter = getAdapter(name ?? 'claude');
+  if (!adapter.statusline) {
+    out(`${adapter.agent} has no status line contextd can use`);
+    process.exit(1);
+  }
+  return adapter;
+}
+
+const statusline = program
+  .command('statusline')
+  .description("the agent's status line: context used, and when /clear is safe");
+
+statusline
+  .command('show', { isDefault: true })
+  .description('print the segment for the status-line payload on stdin (what the agent runs)')
+  .option('--adapter <name>', 'agent whose payload this is', 'claude')
+  .option('--no-color', 'plain text')
+  .action(async (opts, cmd) => {
+    // Redrawn all the time and in any directory: silent on every failure, never creates storage.
+    try {
+      const adapter = statuslineAdapter(opts.adapter as string);
+      const text = await readStdin();
+      const payload = text.trim() ? (JSON.parse(text) as unknown) : {};
+      const at = adapter.statusline!.parse(payload);
+      const dir = at.projectDir ?? ((cmd.optsWithGlobals().cwd as string | undefined) ?? process.cwd());
+      const state = readStatusline(dir, at.sessionId);
+      if (!state) return;
+      const color = opts.color !== false;
+      // A chained command that is contextd itself would call this again, forever.
+      const theirs = state.chain && !isOurStatusline(state.chain) ? runChained(state.chain, text) : '';
+      const line = joinStatusline(theirs, formatStatusline(state, color), color);
+      if (line) out(line);
+    } catch {
+      // Nothing: an error in someone's prompt line is worse than no segment.
+    }
+  });
+
+statusline
+  .command('install')
+  .description("point the agent's status line at contextd (never replaces one you configured)")
+  .option('--adapter <name>', 'agent', 'claude')
+  .option('--chain', 'keep the status line you already have and append contextd to it', false)
+  .action((opts, cmd) => {
+    const adapter = statuslineAdapter(opts.adapter as string);
+    const root = resolve((cmd.optsWithGlobals().cwd as string) ?? process.cwd());
+    const r = adapter.statusline!.install(realHost(root), `${launchString(selfLaunch())} statusline`, {
+      chain: opts.chain === true,
+    });
+    if (r.replaced) setStatuslineChain(root, r.replaced);
+    out(`${adapter.name}: ${r.status.padEnd(9)} ${r.path} - ${r.detail}`);
+    if (r.status === 'conflict') process.exitCode = 1;
+  });
+
+statusline
+  .command('uninstall')
+  .description("remove contextd's status line; one you configured is left alone")
+  .option('--adapter <name>', 'agent', 'claude')
+  .action((opts, cmd) => {
+    const adapter = statuslineAdapter(opts.adapter as string);
+    const root = resolve((cmd.optsWithGlobals().cwd as string) ?? process.cwd());
+    const chain = chainOf(root);
+    const changed = adapter.statusline!.uninstall(realHost(root), isOurStatusline, chain);
+    if (chain) setStatuslineChain(root, null);
+    out(changed.length ? changed.map((p: string) => `${adapter.name}: removed from ${p}`).join('\n') : 'no contextd status line found');
+  });
 
 // --------------------------------------------------------------- projects
 

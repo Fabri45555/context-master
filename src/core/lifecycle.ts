@@ -203,3 +203,54 @@ export function assessPressure(config: Config, input: PressureInput): PressureAs
 function pct(x: number): string {
   return `${Math.round(x * 100)}%`;
 }
+
+/**
+ * When to tell the person the context can be thrown away.
+ *
+ * The ladder keeps memory ready while the window fills, but nothing said *when* discarding the
+ * conversation had become safe - so the agent ran into its limit and compacted on its own, which
+ * is the failure `hard_compactions` counts. contextd cannot clear the window itself (it is not on
+ * the wire, by choice), and clearing piece by piece every turn would defeat the prompt cache; the
+ * useful thing is one well-timed sentence: memory is current, `/clear` now, the next session starts
+ * from the bootstrap.
+ *
+ * Keyed on measured occupancy, not on the stage: a backlog alone escalates the stage, and a
+ * nearly empty window is no reason to clear. Below `pressure_high` there is nothing to say. Above
+ * it, either memory is ready (say so) or it is not (say what to run first).
+ */
+export type ClearAdviceLevel = 'high' | 'critical';
+
+export interface ClearAdvice {
+  level: ClearAdviceLevel;
+  ready: boolean;
+  /** 0..1 of the window. */
+  ratio: number;
+  /** One line for a person, not for the model. */
+  text: string;
+}
+
+export function clearAdvice(config: Config, p: PressureAssessment, bootstrapTokens: number): ClearAdvice | null {
+  const lc = config.lifecycle;
+  if (p.ratio == null || p.ratio < lc.pressure_high) return null;
+  const level: ClearAdviceLevel = p.ratio >= lc.pressure_critical ? 'critical' : 'high';
+  const at = `${Math.round(p.ratio * 100)}%`;
+  if (p.recovery_ready) {
+    return {
+      level,
+      ready: true,
+      ratio: p.ratio,
+      text:
+        `contextd: context at ${at} and project memory is up to date - /clear now and the next ` +
+        `session starts from the ${bootstrapTokens}-token bootstrap` +
+        (level === 'critical' ? ', before the agent compacts on its own.' : '.'),
+    };
+  }
+  return {
+    level,
+    ready: false,
+    ratio: p.ratio,
+    text:
+      `contextd: context at ${at}, but memory is not ready to resume from (${p.recovery_blockers.join('; ')}) - ` +
+      'run `contextd compact` before clearing.',
+  };
+}

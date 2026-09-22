@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { collectBenefits } from '../metrics/benefits.js';
 import { collectHistory } from '../metrics/history.js';
 import { collectRequests } from '../metrics/requests.js';
+import { clearAdvice } from '../core/lifecycle.js';
 import { collectMetrics } from '../metrics/index.js';
 import { MEMORY_CATEGORIES } from '../core/state.js';
 import { diagnose, worstStatus } from '../daemon/doctor.js';
@@ -238,6 +239,8 @@ function overview(manager: ContextManager, scope: Scope = { kind: 'all', session
     never_retrieved_history: manager.store.neverRetrievedHistory(),
     machine: manager.config.limits,
     working: manager.store.workingMemory(),
+    // The same advice the UserPromptSubmit hook gives, read-only here: the page never marks it said.
+    clear_advice: clearAdvice(manager.config, metrics.lifecycle.pressure, manager.bootstrapContext().tokens),
   };
 }
 

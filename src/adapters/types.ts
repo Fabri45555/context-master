@@ -117,6 +117,43 @@ export interface HookInstaller {
   uninstall(env: HostEnv, isOurs: (command: string) => boolean): Array<{ path: string; events: string[] }>;
 }
 
+/** What `contextd hook` has to say back; the adapter decides how the agent expects it. */
+export interface HookReply {
+  /** Context for the model at session start: the bootstrap. */
+  context?: string;
+  /** One line for the person at the keyboard, never shown to the model. */
+  notice?: string;
+}
+
+/** The hook events contextd acts on, in the agent's own terms translated to these. */
+export type HookMoment = 'session_start' | 'user_prompt' | 'other';
+
+/**
+ * A status line the agent renders from a command's stdout. contextd can put the context state
+ * there - occupancy, and whether it is safe to clear - without being on the wire.
+ */
+export interface StatuslineSurface {
+  /** The project and session a status-line payload is about. */
+  parse(stdin: unknown): { projectDir: string | null; sessionId: string | null };
+  /** The command currently configured, and where, or null. */
+  installed(env: HostEnv): { path: string; command: string } | null;
+  /**
+   * Point the agent's status line at `command`. A status line someone else configured is never
+   * overwritten (invariant 45): without `chain` that is a `conflict`; with it, ours takes over in
+   * a scope that wins and `replaced` says what to run first and where to restore it from.
+   */
+  install(
+    env: HostEnv,
+    command: string,
+    opts?: { chain?: boolean },
+  ): { status: 'installed' | 'already' | 'conflict'; path: string; detail: string; replaced?: { path: string; command: string } };
+  /**
+   * Remove it where `isOurs` accepts the command; returns the files changed. `restore` puts a
+   * chained line back into the file it came from.
+   */
+  uninstall(env: HostEnv, isOurs: (command: string) => boolean, restore?: { path: string; command: string } | null): string[];
+}
+
 /** How to start the contextd CLI: a command plus the arguments before the subcommand. */
 export interface Launch {
   command: string;
@@ -257,6 +294,11 @@ export interface Adapter {
    * has never run Gemini.
    */
   detect?(env: HostEnv): boolean;
+  /** Which moment a hook payload marks, so `contextd hook` knows when to reply. */
+  hookMoment?(payload: unknown): HookMoment;
+  /** Serialize a reply the way this agent reads hook output; null prints nothing. */
+  hookReply?(moment: HookMoment, reply: HookReply): string | null;
+  readonly statusline?: StatuslineSurface;
 }
 
 /** Whether contextd can read events from this agent at all (see the `none` surface). */

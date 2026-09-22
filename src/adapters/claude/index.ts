@@ -1,7 +1,8 @@
 import { makeEvent, type ContextEvent, type EventType, type Importance } from '../../core/events.js';
 import { contentHash, sha256 } from '../../core/ids.js';
-import type { Adapter, AdapterContext, AdapterSurface, InstructionFile, TranslateResult } from '../types.js';
+import type { Adapter, AdapterContext, AdapterSurface, HookMoment, HookReply, InstructionFile, TranslateResult } from '../types.js';
 import { candidatesIn } from '../discover.js';
+import { claudeStatusline } from './statusline.js';
 import { claudeHookInstaller, claudeProjectDir } from './hooks.js';
 import { claudeMcp } from './mcp.js';
 import { claudeNativeMemory } from './memory.js';
@@ -151,6 +152,30 @@ export class ClaudeAdapter implements Adapter {
   ];
 
   readonly nativeMemory = claudeNativeMemory;
+
+  readonly statusline = claudeStatusline;
+
+  hookMoment(payload: unknown): HookMoment {
+    const e = payload && typeof payload === 'object' ? (payload as Record<string, unknown>).hook_event_name : null;
+    return e === 'SessionStart' ? 'session_start' : e === 'UserPromptSubmit' ? 'user_prompt' : 'other';
+  }
+
+  /**
+   * Claude Code reads a hook's stdout as JSON. `additionalContext` reaches the model and is only
+   * honoured for SessionStart and UserPromptSubmit; `systemMessage` is shown to the person and never
+   * enters the context - the right place for advice about the context itself.
+   */
+  hookReply(moment: HookMoment, reply: HookReply): string | null {
+    const out: Record<string, unknown> = {};
+    if (reply.context && (moment === 'session_start' || moment === 'user_prompt')) {
+      out.hookSpecificOutput = {
+        hookEventName: moment === 'session_start' ? 'SessionStart' : 'UserPromptSubmit',
+        additionalContext: reply.context,
+      };
+    }
+    if (reply.notice) out.systemMessage = reply.notice;
+    return Object.keys(out).length > 0 ? JSON.stringify(out) : null;
+  }
 
   /** Only `Stop` marks a finished turn whose usage is now written to the transcript. */
   usageSource(hookPayload: unknown): string | null {
