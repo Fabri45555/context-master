@@ -16,6 +16,7 @@ import { providerIsLocal } from '../workers/providers/types.js';
 import { MCP_SERVER_NAME, servesProject } from '../ops/install.js';
 import { isOurHookCommand, resolveCommand } from '../ops/self.js';
 import type { ContextManager } from './manager.js';
+import { staleReferences } from './stale.js';
 
 /**
  * Health check for the wiring.
@@ -56,6 +57,7 @@ export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): C
   checks.push(...latencyChecks(manager));
   checks.push(...integrityChecks(manager));
   checks.push(...embeddingChecks(manager));
+  checks.push(...referenceChecks(manager));
   checks.push(...pullChecks(manager, wiring, opts.pullWindowDays ?? PULL_WINDOW_DAYS));
 
   return checks;
@@ -241,6 +243,34 @@ function embeddingChecks(manager: ContextManager): Check[] {
           ? `covers all ${active} active items (model ${index.model})`
           : `${missing} of ${active} active items not embedded with ${index.model}; semantic search cannot find them`,
       ...(missing === 0 ? {} : { fix: 'run `contextd embed --all`' }),
+    },
+  ];
+}
+
+/**
+ * Memory naming files that are gone. Maintenance already marks an unprotected item stale, so what
+ * is left to report is what code may not settle: a protected item only the user can retire, and
+ * unprotected ones maintenance has not reached yet. Read-only - a stat per path, no patch.
+ */
+function referenceChecks(manager: ContextManager): Check[] {
+  const report = staleReferences(manager.store, manager.projectRoot);
+  if (report.checked === 0) return [];
+  const live = report.stale.filter((f) => manager.store.getItem(f.id)?.status === 'active');
+  if (live.length === 0) {
+    return [{ name: 'file references', status: 'ok', detail: `${report.checked} items name files that exist` }];
+  }
+  const protectedOnes = live.filter((f) => f.protected);
+  const list = (fs: typeof live) =>
+    fs.slice(0, 3).map((f) => `${f.id} (${[...f.missing, ...f.appeared].join(', ')})`).join('; ');
+  return [
+    {
+      name: 'file references',
+      status: 'warn',
+      detail: `${live.length} active item(s) name files that no longer exist: ${list(live)}`,
+      fix:
+        protectedOnes.length > 0
+          ? `protected, so only you can retire them: contextd forget ${protectedOnes.map((f) => f.id).join(' ')} --reason "file removed"`
+          : 'maintenance marks them stale during the next agent session; `contextd forget <id> --reason "file removed"` retires one now',
     },
   ];
 }

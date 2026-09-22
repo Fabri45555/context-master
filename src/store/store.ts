@@ -468,6 +468,14 @@ export class ContextStore {
       ].filter(Boolean);
       const patch = notes.length > 0 ? { ...checked.patch, note: notes.join(' | ') } : checked.patch;
       const violations = validatePatch(patch, state);
+      // Consent to lift protection is a person's to give. `import` replays a log that was checked
+      // when it was first written, so it may carry one; a worker or the fold may not.
+      if (patch.release_protected?.length && origin !== 'user' && origin !== 'import') {
+        violations.push({
+          code: 'protected_item',
+          message: `only a person may release user-critical items (${patch.release_protected.join(', ')})`,
+        });
+      }
       if (violations.length > 0) {
         return {
           ok: false,

@@ -361,8 +361,14 @@ export class ContextManager {
    * because there is nothing to replace them with; the patch log keeps them and the reason.
    * User-critical items still refuse, by `isProtected`, whoever asks.
    */
-  retire(ids: string[], reason: string): ReturnType<ContextStore['commitPatch']> {
-    return this.store.commitPatch({ remove: ids, note: `retired: ${reason}` }, 'user', {});
+  /**
+   * `releaseProtected` lifts protection from those ids for this one patch. Only the CLI passes it,
+   * after a person typed the id at an interactive terminal; the MCP tool never does, because the
+   * caller there is the agent.
+   */
+  retire(ids: string[], reason: string, opts: { releaseProtected?: string[] } = {}): ReturnType<ContextStore['commitPatch']> {
+    const release = opts.releaseProtected?.length ? { release_protected: opts.releaseProtected } : {};
+    return this.store.commitPatch({ remove: ids, note: `retired: ${reason}`, ...release }, 'user', {});
   }
 
   /**

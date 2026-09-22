@@ -112,6 +112,13 @@ export const StatePatchSchema = z.object({
   reopen: z.array(z.string()).optional(),
   /** Free-form note explaining the patch, shown in `contextd inspect`. */
   note: z.string().optional(),
+  /**
+   * User-critical ids a person confirmed, at an interactive terminal, may be removed by this patch.
+   * Without it nothing could correct a wrong or duplicated user instruction (invariant 36). Only a
+   * `user`-origin commit may carry it - `commitPatch` rejects it from a worker or the fold, which
+   * could otherwise write it into their JSON - and it is kept in the log as the record of consent.
+   */
+  release_protected: z.array(z.string()).optional(),
 });
 
 export type StatePatch = z.infer<typeof StatePatchSchema>;
@@ -335,7 +342,7 @@ export function validatePatch(patch: StatePatch, state: ProjectState): PatchViol
       violations.push({ code: 'unknown_item', message: `remove targets unknown id ${id}`, ref: id });
       continue;
     }
-    if (existing && isProtected(existing)) {
+    if (existing && isProtected(existing) && !(patch.release_protected ?? []).includes(id)) {
       violations.push({
         code: 'protected_item',
         message: `cannot remove user-critical item ${id}`,

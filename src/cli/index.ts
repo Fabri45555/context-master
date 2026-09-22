@@ -33,7 +33,7 @@ import {
 import { applyNativeImport, planNativeImport } from '../ops/import-native.js';
 import { formatOverview, summarizeProject } from '../ops/overview.js';
 import { createInterface } from 'node:readline/promises';
-import { StatePatchSchema } from '../core/patch.js';
+import { isProtected, StatePatchSchema } from '../core/patch.js';
 import { CONFIG_FILENAMES, findConfigFile, type WorkerTask } from '../core/config.js';
 import { ContextManager } from '../daemon/manager.js';
 import { formatMetrics, formatPressure } from '../metrics/index.js';
@@ -777,10 +777,42 @@ program
   .description('retire memory items that are wrong or not project state (kept in the patch log)')
   .argument('<ids...>', 'ids of the items to retire')
   .requiredOption('--reason <why>', 'why they are wrong - recorded in the patch log')
-  .action((ids: string[], opts, cmd) => {
+  .option('--protected', 'also user-critical items; asks you to type each id at an interactive terminal', false)
+  .action(async (ids: string[], opts, cmd) => {
     const m = manager(cmd);
     try {
-      const result = m.retire(ids, opts.reason as string);
+      let release: string[] = [];
+      if (opts.protected === true) {
+        const guarded = ids.filter((id) => {
+          const item = m.store.getItem(id);
+          return item != null && isProtected(item);
+        });
+        if (guarded.length > 0) {
+          // The consent has to come from a person. An agent's shell tool is not a terminal, so this
+          // is the line between the user correcting their own instruction and an agent removing it.
+          if (!process.stdin.isTTY || !process.stdout.isTTY) {
+            out(`refused: ${guarded.join(', ')} ${guarded.length === 1 ? 'is' : 'are'} user-critical; releasing ${guarded.length === 1 ? 'it' : 'them'} must be confirmed at an interactive terminal`);
+            process.exitCode = 1;
+            return;
+          }
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          try {
+            for (const id of guarded) {
+              out(`${id}  ${m.store.getItem(id)?.text ?? ''}`);
+              const typed = (await rl.question(`user-critical. Type ${id} to retire it: `)).trim();
+              if (typed !== id) {
+                out('not confirmed; nothing retired');
+                process.exitCode = 1;
+                return;
+              }
+            }
+          } finally {
+            rl.close();
+          }
+          release = guarded;
+        }
+      }
+      const result = m.retire(ids, opts.reason as string, { releaseProtected: release });
       if (!result.ok) {
         out(`rejected: ${result.violations.map((v) => `${v.code} ${v.message}`).join('; ')}`);
         process.exitCode = 1;

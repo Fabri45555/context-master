@@ -109,10 +109,10 @@ export function formatSimilarHint(written: MemoryItem, hits: SimilarHit[], surfa
     advice.push(`If ${newId} replaces ${retirable.length === 1 ? retirable[0] : `one of ${retirable.join(', ')}`}: ${retire(retirable, `replaced by ${newId}`)}.`);
   }
   if (fixed.length > 0) {
-    advice.push(`${fixed.join(', ')} ${fixed.length === 1 ? 'is' : 'are'} user-critical and cannot be retired; if ${newId} contradicts ${fixed.length === 1 ? 'it' : 'them'}, raise it with the user.`);
+    advice.push(`${fixed.join(', ')} ${fixed.length === 1 ? 'is' : 'are'} user-critical and cannot be retired by an agent; if ${newId} contradicts ${fixed.length === 1 ? 'it' : 'them'}, raise it with the user.`);
   }
   if (isProtected(written)) {
-    advice.push(`${newId} is user-critical too, so a duplicate cannot be retired either.`);
+    advice.push(`${newId} is user-critical too; only the user can retire a duplicate, with \`contextd forget ${newId} --protected\` at a terminal.`);
   } else {
     advice.push(`If ${newId} only repeats it: ${retire([newId], 'duplicate')}.`);
   }

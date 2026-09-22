@@ -305,6 +305,20 @@ describe('end to end', () => {
       const attack = manager.store.commitPatch({ remove: [id] }, 'worker', {});
       expect(attack.ok).toBe(false);
       expect(attack.violations[0]!.code).toBe('protected_item');
+
+      // Consent written into a worker's JSON is not consent, and the agent's MCP retire has no
+      // way to give it.
+      const forged = manager.store.commitPatch({ remove: [id], release_protected: [id] }, 'worker', {});
+      expect(forged.ok).toBe(false);
+      expect(forged.violations.map((v) => v.code)).toContain('protected_item');
+      expect(manager.retire([id], 'agent thinks it is wrong').ok).toBe(false);
+
+      // The user, having confirmed at a terminal, can correct their own instruction (invariant 36).
+      const released = manager.retire([id], 'duplicate', { releaseProtected: [id] });
+      expect(released.ok).toBe(true);
+      expect(manager.store.getItem(id)?.status).not.toBe('active');
+      // The consent is in the log, so replay rebuilds the same state.
+      expect(manager.store.replay().items.find((i) => i.id === id)?.status).toBe(manager.store.getItem(id)?.status);
     } finally {
       cleanup();
     }

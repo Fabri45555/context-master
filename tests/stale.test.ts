@@ -6,6 +6,7 @@ import { extractPathReferences, itemReferences } from '../src/core/references.js
 import type { MemoryItem } from '../src/core/state.js';
 import type { ContextManager } from '../src/daemon/manager.js';
 import { STALE_TAG, staleReferences } from '../src/daemon/stale.js';
+import { diagnose } from '../src/daemon/doctor.js';
 import { makeManager } from './helpers.js';
 
 function touch(root: string, rel: string): void {
@@ -199,5 +200,37 @@ describe('stale file references', () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+describe('doctor: file references', () => {
+  const check = (m: ContextManager, root: string) =>
+    diagnose(m, { host: { projectRoot: root, home: join(root, '.home'), vars: {} } }).find(
+      (c) => c.name === 'file references',
+    );
+
+  it('names a protected item whose file is gone and tells the user how to retire it', () => {
+    withManager((m, root) => {
+      touch(root, 'src/live.ts');
+      add(m, { id: 'f1', category: 'important_files', text: '`src/live.ts` holds the parser.' });
+      expect(check(m, root)?.status).toBe('ok');
+
+      add(
+        m,
+        { id: 'c1', category: 'constraints', text: 'Never edit `src/generated/schema.ts` by hand.', source: 'user', importance: 'critical' },
+        'user',
+      );
+      const c = check(m, root);
+      expect(c?.status).toBe('warn');
+      expect(c?.detail).toContain('c1 (src/generated/schema.ts)');
+      expect(c?.fix).toContain('contextd forget c1');
+    });
+  });
+
+  it('says nothing when no item names a file', () => {
+    withManager((m, root) => {
+      add(m, { id: 'd1', category: 'decisions', text: 'Prefer small modules.' });
+      expect(check(m, root)).toBeUndefined();
+    });
   });
 });
