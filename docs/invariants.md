@@ -356,8 +356,8 @@ Breaking one of these breaks a PRD guarantee, so change them deliberately or not
 
 63. **A status line someone had is never lost.** `statusline install` writes the personal
     `.claude/settings.local.json`, never the committed settings. An existing line is a conflict;
-    `--chain` runs it first with the same payload, records it in the project's own config (never
-    quoted into settings.json) and `uninstall` puts it back in the file it came from. Rendering is
+    `--chain` runs it first with the same payload, records it in the project's local store (never
+    the committed config: it is a path on one machine; never quoted into settings.json) and `uninstall` puts it back in the file it came from. Rendering is
     silent on every failure, bounded to a second for the chained command, and creates no storage.
 
 64. **A worker on Claude Code is not a session.** The `claude-code` provider runs `claude -p` with

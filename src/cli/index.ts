@@ -1585,22 +1585,29 @@ function isOurStatusline(command: string): boolean {
 }
 
 /**
- * Record (or forget) the status line `--chain` took over, in the project's own config file - the
- * one file here that is contextd's to edit. Quoting someone's command into settings.json instead
- * would be one shell-escaping bug away from breaking their prompt.
+ * Record (or forget) the status line `--chain` took over. In the project's store, which is local
+ * and gitignored: the command is a path on this machine (a plugin cache, a script in a home
+ * directory), and the committed config would hand it to everyone who clones the repo. Never quoted
+ * into settings.json either - one shell-escaping bug away from breaking someone's prompt.
  */
 function setStatuslineChain(root: string, chain: { path: string; command: string } | null): void {
-  const path = findConfigFile(root) ?? join(root, CONFIG_FILENAMES[0]!);
-  const current = existsSync(path) ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>) : {};
-  const next = { ...current };
-  if (chain) next.statusline = { chain: chain.command, chain_from: chain.path };
-  else delete next.statusline;
-  writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  const m = new ContextManager({ cwd: root });
+  try {
+    m.setStatuslineChain(chain);
+  } finally {
+    m.close();
+  }
 }
 
 function chainOf(root: string): { path: string; command: string } | null {
-  const s = loadConfig(root).config.statusline;
-  return s.chain && s.chain_from ? { path: s.chain_from, command: s.chain } : null;
+  const loaded = loadConfig(root);
+  if (!existsSync(dbPath(loaded.storageDir))) return null;
+  const m = new ContextManager({ cwd: root });
+  try {
+    return m.statuslineChain();
+  } finally {
+    m.close();
+  }
 }
 
 function statuslineAdapter(name: string | undefined): Adapter {

@@ -25,10 +25,7 @@ export interface StatuslineState {
 export function readStatusline(projectDir: string, sessionId: string | null): StatuslineState | null {
   const root = resolve(projectDir);
   const loaded = loadConfig(root);
-  if (!existsSync(dbPath(loaded.storageDir))) {
-    // No memory here, but a chained line still belongs on screen.
-    return loaded.config.statusline.chain ? { ratio: null, items: 0, advice: null, chain: loaded.config.statusline.chain } : null;
-  }
+  if (!existsSync(dbPath(loaded.storageDir))) return null;
   const m = new ContextManager({ cwd: root });
   try {
     const p = m.pressure(sessionId);
@@ -37,7 +34,7 @@ export function readStatusline(projectDir: string, sessionId: string | null): St
       ratio: p.ratio,
       items: m.store.allItems(false).filter((i) => i.status === 'active').length,
       advice: advice ? (advice.ready ? 'ready' : 'blocked') : null,
-      chain: m.config.statusline.chain,
+      chain: m.statuslineChain()?.command ?? null,
     };
   } finally {
     m.close();

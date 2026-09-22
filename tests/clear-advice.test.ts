@@ -172,6 +172,12 @@ describe('status line', () => {
       const state = readStatusline(root, 's1')!;
       expect(state).toMatchObject({ advice: 'ready', items: 1 });
       expect(formatStatusline(state, false)).toBe('contextd · ctx 80% · memory ready: /clear is safe');
+      // The chained line lives in the local store, never the committed config.
+      expect(state.chain).toBeNull();
+      manager.setStatuslineChain({ command: 'my-line.sh', path: '/home/u/.claude/settings.json' });
+      expect(readStatusline(root, 's1')!.chain).toBe('my-line.sh');
+      manager.setStatuslineChain(null);
+      expect(manager.statuslineChain()).toBeNull();
       expect(formatStatusline({ ratio: 0.3, items: 12, advice: null, chain: null }, false)).toBe('contextd · ctx 30% · 12 items');
       expect(formatStatusline({ ratio: null, items: 3, advice: null, chain: null }, false)).toBe('contextd · 3 items');
     } finally {

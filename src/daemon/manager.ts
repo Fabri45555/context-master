@@ -514,6 +514,21 @@ export class ContextManager {
     });
   }
 
+  /** The status line `statusline install --chain` took over, if any (local to this machine). */
+  statuslineChain(): { path: string; command: string } | null {
+    const command = getMeta(this.store.db, 'statusline_chain');
+    const path = getMeta(this.store.db, 'statusline_chain_from');
+    if (command && path) return { command, path };
+    // An older install kept it in the config file; still honoured, never written there again.
+    const c = this.config.statusline;
+    return c.chain && c.chain_from ? { command: c.chain, path: c.chain_from } : null;
+  }
+
+  setStatuslineChain(chain: { path: string; command: string } | null): void {
+    setMeta(this.store.db, 'statusline_chain', chain?.command ?? '');
+    setMeta(this.store.db, 'statusline_chain_from', chain?.path ?? '');
+  }
+
   /** Whether to tell the person the context can be cleared now (see `clearAdvice`). Reads only. */
   clearAdviceNow(sessionId: string | null): ClearAdvice | null {
     const p = this.pressure(sessionId);
