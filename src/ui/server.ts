@@ -121,7 +121,7 @@ async function handle(
       case '/api/benefits': {
         const scope = scopeOf(manager, url);
         const sessionId = scope.session?.id ?? null;
-        const metrics = collectMetrics(manager.store, manager.config, sessionId);
+        const metrics = collectMetrics(manager.store, manager.config, sessionId, manager.projectRoot);
         send(res, 200, {
           root: manager.projectRoot,
           scope,
@@ -206,7 +206,7 @@ function scopeOf(manager: ContextManager, url: URL): Scope {
 }
 
 function overview(manager: ContextManager, scope: Scope = { kind: 'all', session: null }) {
-  const metrics = collectMetrics(manager.store, manager.config, scope.session?.id ?? null);
+  const metrics = collectMetrics(manager.store, manager.config, scope.session?.id ?? null, manager.projectRoot);
   return {
     scope,
     project: manager.config.project.name ?? null,

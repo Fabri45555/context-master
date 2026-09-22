@@ -3,6 +3,7 @@ import type { StatePatch, AddItem } from './patch.js';
 import { isSuccessfulMilestone, looksLikeError } from './importance.js';
 import { isSensitivePath } from './redact.js';
 import { collectAttempts, findRecoveries, type Recovery } from './recovery.js';
+import type { MemoryItem } from './state.js';
 
 /**
  * PRD 13 - the deterministic fold.
@@ -41,6 +42,11 @@ export interface FoldContext {
   issueForEvent?: (eventId: string) => string | null;
   /** Project root: a recovery rule is only about paths inside it. */
   root?: string | null;
+  /**
+   * The unprotected recovery rules, active or stale, already learned about this wrong path or
+   * command. Asked only when a recovery was learned, so the hook path pays nothing otherwise.
+   */
+  recoveryRules?: (kind: 'path' | 'command', failedKey: string) => MemoryItem[];
 }
 
 export function deterministicFold(events: StoredEvent[], ctx: FoldContext = {}): FoldResult {
@@ -206,20 +212,28 @@ export function deterministicFold(events: StoredEvent[], ctx: FoldContext = {}):
   }
 
   const learned = learnRecoveries(events, ctx);
-  for (const r of learned) {
-    const failedId = r.failed.resultEventId;
-    const sameBatchIssue = issueOfEvent.get(failedId);
-    // The failure was recorded as an issue in this very batch: the fix arrived with it, so the
-    // issue is never written rather than written and retired.
-    if (sameBatchIssue) add.splice(add.indexOf(sameBatchIssue), 1);
-    const olderIssue = sameBatchIssue ? null : (ctx.issueForEvent?.(failedId) ?? null);
-    add.push(recoveryItem(r, olderIssue));
-    notes.push(r.kind === 'path' ? 'path_recovery' : 'command_recovery');
-    // Both ends are now evidence of derived state. The failure is only re-classified when it is
-    // in this batch; an older one keeps whatever status it was closed with.
-    consumed.push(r.success.resultEventId);
-    if (inert.includes(failedId)) consumed.push(failedId);
+  const ruleOps: RuleOps = { add: [], update: [], touch: [], supersede: [] };
+  for (const group of groupRecoveries(learned)) {
+    const issues: string[] = [];
+    for (const r of group) {
+      const failedId = r.failed.resultEventId;
+      const sameBatchIssue = issueOfEvent.get(failedId);
+      // The failure was recorded as an issue in this very batch: the fix arrived with it, so the
+      // issue is never written rather than written and retired.
+      if (sameBatchIssue) add.splice(add.indexOf(sameBatchIssue), 1);
+      const olderIssue = sameBatchIssue ? null : (ctx.issueForEvent?.(failedId) ?? null);
+      if (olderIssue && !issues.includes(olderIssue)) issues.push(olderIssue);
+      notes.push(r.kind === 'path' ? 'path_recovery' : 'command_recovery');
+      // Both ends are now evidence of derived state. The failure is only re-classified when it is
+      // in this batch; an older one keeps whatever status it was closed with.
+      consumed.push(r.success.resultEventId);
+      if (inert.includes(failedId)) consumed.push(failedId);
+    }
+    const head = group[0]!;
+    const existing = ctx.recoveryRules?.(head.kind, head.failed.key) ?? [];
+    planRecoveryRules(group, existing, issues, ruleOps);
   }
+  add.push(...ruleOps.add);
   if (learned.length > 0) {
     // A success the fold had closed as inert (a plain exit 0) is now what state was derived from.
     const derived = new Set(consumed);
@@ -231,6 +245,9 @@ export function deterministicFold(events: StoredEvent[], ctx: FoldContext = {}):
   const patch: StatePatch = {};
   if (Object.keys(working).length > 0) patch.working = working;
   if (add.length > 0) patch.add = add;
+  if (ruleOps.update.length > 0) patch.update = ruleOps.update;
+  if (ruleOps.touch.length > 0) patch.touch = ruleOps.touch;
+  if (ruleOps.supersede.length > 0) patch.supersede = ruleOps.supersede;
   if (notes.length > 0) patch.note = `deterministic fold: ${[...new Set(notes)].join(', ')}`;
 
   return { patch, fileNotes, consumed, inert };
@@ -251,23 +268,159 @@ function learnRecoveries(events: StoredEvent[], ctx: FoldContext): Recovery[] {
 }
 
 /**
+ * How long a recovery rule is served without being seen again. Borrowed from headroom, which drops
+ * a learned error pattern after 21 days unseen: a mistake the agent has stopped making is either
+ * learned or about a layout that has moved on. It fades through the ordinary TTL decay - `stale`,
+ * not deleted (invariant 13) - and seeing the mistake again revives it.
+ */
+export const RECOVERY_TTL_SECONDS = 21 * 86_400;
+
+/** Evidence a rule keeps accumulating. Past this, re-observation only revalidates it. */
+const MAX_RULE_EVIDENCE = 12;
+
+interface RuleOps {
+  add: AddItem[];
+  update: NonNullable<StatePatch['update']>;
+  touch: string[];
+  supersede: NonNullable<StatePatch['supersede']>;
+}
+
+/** Recoveries of one wrong path or command, in the order they were learned. */
+function groupRecoveries(learned: Recovery[]): Recovery[][] {
+  const groups = new Map<string, Recovery[]>();
+  for (const r of learned) {
+    const key = `${r.kind}\u0000${r.failed.key}`;
+    const g = groups.get(key) ?? [];
+    g.push(r);
+    groups.set(key, g);
+  }
+  return [...groups.values()];
+}
+
+function stringList(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+/** The file a path rule says was meant, or every file an ambiguous one has seen. */
+function rightPathsOf(rule: MemoryItem): string[] {
+  return rule.fields.ambiguous === true ? stringList(rule.fields.candidates) : stringList(rule.fields.references);
+}
+
+function evidenceOf(group: Recovery[]): string[] {
+  return [...new Set(group.flatMap((r) => [r.failed.resultEventId, r.success.resultEventId]))];
+}
+
+/**
+ * Seeing a rule's mistake again is evidence that it is still true: revalidate it (`touch` sets
+ * `last_validated_at`, which the TTL counts from), add the new evidence, revive it if it had
+ * faded - never add it a second time.
+ */
+function revalidate(rule: MemoryItem, group: Recovery[], ops: RuleOps, fields: Record<string, unknown> = {}): void {
+  const fresh = evidenceOf(group).filter((id) => !rule.evidence.includes(id));
+  const room = Math.max(0, MAX_RULE_EVIDENCE - rule.evidence.length);
+  const change: RuleOps['update'][number] = { id: rule.id };
+  if (fresh.length > 0 && room > 0) change.evidence = fresh.slice(0, room);
+  if (rule.status === 'stale') change.status = 'active';
+  const merged = rule.fields.stale_paths != null ? { ...fields, stale_paths: null } : fields;
+  if (Object.keys(merged).length > 0) change.fields = merged;
+  if (rule.ttl_seconds == null) change.ttl_seconds = RECOVERY_TTL_SECONDS;
+  if (Object.keys(change).length > 1) ops.update.push(change);
+  ops.touch.push(rule.id);
+}
+
+/**
+ * Turn the recoveries of one wrong path or command into patch operations, against the rules
+ * already learned about it.
+ *
+ * One wrong path "fixed" to two different files is not a typo, it is ambiguity: `src/utils.ts`
+ * reached for when the agent meant whichever utility module the task needed. Two rules each
+ * naming one file would send the next session to the wrong one half the time, so they collapse
+ * into a single rule that says to search. The old rules are retired by `add.supersedes`, which
+ * `validatePatch` guards like any other retirement (invariant 12); a protected rule never reaches
+ * here, because the lookup does not return one.
+ */
+function planRecoveryRules(group: Recovery[], existing: MemoryItem[], issues: string[], ops: RuleOps): void {
+  const head = group[0]!;
+  const retireIssues = (by: string) => {
+    for (const id of issues) ops.supersede.push({ id, by, reason: 'the failure was recovered from' });
+  };
+
+  if (head.kind === 'command') {
+    const fixes = [...new Set(group.map((r) => r.success.key))];
+    fixes.forEach((fix, n) => {
+      const same = group.filter((r) => r.success.key === fix);
+      const rule = existing.find((i) => i.fields.command === fix);
+      if (rule) {
+        revalidate(rule, same, ops);
+        if (n === 0) retireIssues(rule.id);
+      } else {
+        ops.add.push(recoveryItem(same, n === 0 ? issues : []));
+      }
+    });
+    return;
+  }
+
+  const ambiguous = existing.find((i) => i.fields.ambiguous === true);
+  const plain = existing.filter((i) => i.fields.ambiguous !== true);
+  const rights = [...new Set([...existing.flatMap(rightPathsOf), ...group.map((r) => r.success.key)])];
+
+  if (ambiguous) {
+    const known = stringList(ambiguous.fields.candidates);
+    revalidate(ambiguous, group, ops, rights.length > known.length ? { candidates: rights } : {});
+    for (const p of plain) {
+      ops.supersede.push({ id: p.id, by: ambiguous.id, reason: 'the same wrong path was fixed to different files' });
+    }
+    retireIssues(ambiguous.id);
+    return;
+  }
+  if (rights.length >= 2) {
+    ops.add.push({
+      category: 'discoveries',
+      // No count of the files in the text: it would be false as soon as there is one more (invariant 28).
+      text: `\`${head.failed.key}\` does not exist; search for the file before opening it (it has been several different files).`,
+      importance: 'medium',
+      confidence: 0.7,
+      source: 'deterministic',
+      evidence: evidenceOf(group).slice(0, MAX_RULE_EVIDENCE),
+      reason: 'calls on this path failed as not found, and were followed by successful calls on different files',
+      ttl_seconds: RECOVERY_TTL_SECONDS,
+      tags: ['recovery'],
+      supersedes: [...plain.map((p) => p.id), ...issues],
+      // Only the missing path is a claim the staleness check may test; the candidates are history.
+      fields: { recovery: 'path', ambiguous: true, absent_references: [head.failed.key], candidates: rights },
+    });
+    return;
+  }
+  const rule = plain.find((p) => rightPathsOf(p).includes(head.success.key));
+  if (rule) {
+    revalidate(rule, group, ops);
+    retireIssues(rule.id);
+    return;
+  }
+  ops.add.push(recoveryItem(group, issues));
+}
+
+/**
  * The durable rule a recovery teaches.
  *
  * A wrong path is a fact about the repository's layout, so it is a `discoveries` item: served
  * by query when the agent works near that file, not taxed on every bootstrap. A command that does
  * not work here, and the one that does, is how this project is operated - a `conventions` item,
  * which the bootstrap serves, because the agent will not think to query before running it.
+ *
+ * `same` is every recovery in the batch with this failure and this fix; the first one speaks.
  */
-function recoveryItem(r: Recovery, supersedes: string | null): AddItem {
-  const evidence = [r.failed.resultEventId, r.success.resultEventId];
+function recoveryItem(same: Recovery[], supersedes: string[]): AddItem {
+  const r = same[0]!;
   const base = {
     text: r.text,
     importance: 'medium' as const,
     confidence: 0.7,
     source: 'deterministic' as const,
-    evidence,
+    evidence: evidenceOf(same).slice(0, MAX_RULE_EVIDENCE),
+    ttl_seconds: RECOVERY_TTL_SECONDS,
     tags: ['recovery'],
-    ...(supersedes ? { supersedes: [supersedes] } : {}),
+    ...(supersedes.length > 0 ? { supersedes } : {}),
   };
   if (r.kind === 'path') {
     return {

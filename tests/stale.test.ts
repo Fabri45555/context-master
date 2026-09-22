@@ -183,6 +183,35 @@ describe('stale file references', () => {
     });
   });
 
+  it('retires a path recovery once the right file is gone', () => {
+    withManager((m, root) => {
+      touch(root, 'src/fold.ts');
+      add(m, {
+        id: 'r1',
+        category: 'discoveries',
+        text: '`src/fold.js` does not exist; the file is `src/fold.ts`.',
+        fields: { recovery: 'path', references: ['src/fold.ts'], absent_references: ['src/fold.js'] },
+      });
+      rmSync(join(root, 'src/fold.ts'));
+      expect(staleReferences(m.store, root).stale[0]).toMatchObject({ id: 'r1', missing: ['src/fold.ts'], appeared: [] });
+    });
+  });
+
+  it('checks a collapsed path rule only on the path it says is missing', () => {
+    withManager((m, root) => {
+      add(m, {
+        id: 'r1',
+        category: 'discoveries',
+        text: '`src/utils.ts` does not exist; search for the file before opening it (it has been several different files).',
+        fields: { recovery: 'path', ambiguous: true, absent_references: ['src/utils.ts'], candidates: ['src/util.ts', 'src/utils.tsx'] },
+      });
+      // The files it once turned out to be are history: their absence proves nothing.
+      expect(staleReferences(m.store, root).stale).toHaveLength(0);
+      touch(root, 'src/utils.ts');
+      expect(staleReferences(m.store, root).stale[0]).toMatchObject({ id: 'r1', appeared: ['src/utils.ts'] });
+    });
+  });
+
   it('runs on the maintain rung, throttled on the hook path', async () => {
     withManager(() => undefined);
     const { manager: m, cleanup } = makeManager();

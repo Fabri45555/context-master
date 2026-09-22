@@ -396,7 +396,7 @@ export class ContextManager {
   }
 
   metrics(sessionId: string | null): Metrics {
-    return collectMetrics(this.store, this.config, sessionId);
+    return collectMetrics(this.store, this.config, sessionId, this.projectRoot);
   }
 
   /** Phase 4 - the optional semantic index. Empty and inert unless configured. */

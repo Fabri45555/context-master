@@ -333,6 +333,49 @@ export class ContextStore {
   }
 
   /**
+   * The recovery rules already learned about this wrong path or command, live or faded.
+   *
+   * What lets the fold revalidate a rule instead of re-adding it, and see that one wrong path has
+   * been "fixed" to different files. A stale rule is included so that seeing the mistake again
+   * revives it; a retired one is not - it was superseded or removed for a reason. A protected
+   * item is never returned: the fold may not supersede or rewrite one (invariant 12).
+   */
+  recoveryRulesFor(kind: 'path' | 'command', failedKey: string): MemoryItem[] {
+    const match =
+      kind === 'path'
+        ? `EXISTS (SELECT 1 FROM json_each(m.fields, '$.absent_references') a WHERE a.value = ?)`
+        : `json_extract(m.fields, '$.failed_command') = ?`;
+    const rows = this.db
+      .prepare(
+        `SELECT m.* FROM memory_items m
+         WHERE m.status IN ('active', 'stale') AND json_extract(m.fields, '$.recovery') = ? AND ${match}
+         ORDER BY m.created_at ASC`,
+      )
+      .all(kind, failedKey) as Array<Record<string, unknown>>;
+    return rows.map(rowToItem).filter((i) => !isProtected(i));
+  }
+
+  /**
+   * The tool traffic and user turns of one session, or of the most recent `sessions` sessions,
+   * grouped by session and in event order: what loop detection reads. Not for the hook path - it
+   * reads whole sessions (invariant 17).
+   */
+  sessionTraffic(sessionId: string | null, sessions = 20): StoredEvent[] {
+    const types = `('TOOL_CALL', 'FILE_CHANGED', 'TOOL_RESULT', 'ERROR_DETECTED', 'COMMAND_EXECUTED', 'USER_MESSAGE')`;
+    const ids = sessionId
+      ? [sessionId]
+      : (
+          this.db
+            .prepare(`SELECT session_id, MAX(ts) last FROM events GROUP BY session_id ORDER BY last DESC LIMIT ?`)
+            .all(sessions) as Array<{ session_id: string }>
+        ).map((r) => r.session_id);
+    const stmt = this.db.prepare(
+      `SELECT * FROM events WHERE session_id = ? AND type IN ${types} ORDER BY ts ASC, rowid ASC`,
+    );
+    return ids.flatMap((id) => (stmt.all(id) as Array<Record<string, unknown>>).map((r) => this.rowToEvent(r)));
+  }
+
+  /**
    * The active known issue the fold recorded from this event, when a patch may still retire it.
    *
    * A protected item is never returned: an `add.supersedes` naming one would be refused by

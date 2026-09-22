@@ -21,6 +21,7 @@ import { isOurHookCommand, resolveCommand } from '../ops/self.js';
 import type { ContextManager } from './manager.js';
 import { staleReferences } from './stale.js';
 import { buildDrift, packageRootOf, scriptBehind } from './drift.js';
+import { collectToolCalls, detectLoops } from '../core/loops.js';
 
 /**
  * Health check for the wiring.
@@ -66,6 +67,7 @@ export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): C
   checks.push(...integrityChecks(manager));
   checks.push(...embeddingChecks(manager));
   checks.push(...referenceChecks(manager));
+  checks.push(...loopChecks(manager));
   checks.push(...pullChecks(manager, wiring, opts.pullWindowDays ?? PULL_WINDOW_DAYS));
 
   return checks;
@@ -357,6 +359,35 @@ function referenceChecks(manager: ContextManager): Check[] {
         protectedOnes.length > 0
           ? `protected, so only you can retire them: contextd forget ${protectedOnes.map((f) => f.id).join(' ')} --reason "file removed"`
           : 'maintenance marks them stale during the next agent session; `contextd forget <id> --reason "file removed"` retires one now',
+    },
+  ];
+}
+
+/**
+ * Did the latest session loop - the same call, the same answer, nothing changed in between? A
+ * signal about how the agent worked, not about the project, so it is reported here and never
+ * written to memory (invariant 28). Reads one session's traffic; doctor is not the hook path.
+ */
+function loopChecks(manager: ContextManager): Check[] {
+  const events = manager.store.sessionTraffic(null, 1);
+  if (events.length === 0) return [];
+  const loops = detectLoops(collectToolCalls(events, manager.projectRoot));
+  const session = events[0]!.session_id;
+  if (loops.length === 0) {
+    return [{ name: 'agent loops', status: 'ok', detail: `latest session (${session}) repeated no call without cause` }];
+  }
+  const shown = loops
+    .slice(0, 3)
+    .map((l) => `${l.tool} \`${l.display.slice(0, 60)}\` ${l.repeats}x${l.errorLoop ? ' (failing)' : ''}`)
+    .join('; ');
+  return [
+    {
+      name: 'agent loops',
+      status: 'warn',
+      detail: `latest session (${session}) repeated the same call with the same answer and nothing changed in between: ${shown}`,
+      fix: loops.some((l) => l.errorLoop)
+        ? 'a call that keeps failing the same way will not start working: read the error, or record what fixes it with `contextd remember`'
+        : 'the answer was already in context; if the agent lost it to compaction, check `contextd status` for pressure',
     },
   ];
 }

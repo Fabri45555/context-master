@@ -85,7 +85,7 @@ export function benchmark(manager: ContextManager, sessionId: string | null): Be
     series.push({ cumulative, managed: managedPerTurn });
   }
 
-  const m = collectMetrics(store, manager.config, sessionId);
+  const m = collectMetrics(store, manager.config, sessionId, manager.projectRoot);
   const workerTokens = m.workers.input_tokens + m.workers.output_tokens;
   const observed = m.agent.input_tokens + m.agent.output_tokens;
 

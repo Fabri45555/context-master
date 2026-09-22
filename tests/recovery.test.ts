@@ -349,3 +349,158 @@ describe('recovery helpers', () => {
     expect(errorClass('Exit code 1\nAssertionError: boom')).toBeNull();
   });
 });
+
+describe('refining learned rules', () => {
+  /** A not-found read of `wrong`, then a successful read of `right`, under fresh call ids. */
+  let pairSeq = 0;
+  const pair = (root: string, wrong: string, right: string, session = 's1') => {
+    pairSeq += 1;
+    const a = `p${pairSeq}a`;
+    const b = `p${pairSeq}b`;
+    return [
+      call(a, 'Read', { file_path: `${root}/${wrong}` }, session),
+      result(a, 'File does not exist.', true, session),
+      call(b, 'Read', { file_path: `${root}/${right}` }, session),
+      result(b, FILE_BODY, false, session),
+    ];
+  };
+  const active = (m: ContextManager) => recoveries(m).filter((i) => i.status === 'active');
+
+  it('collapses one wrong path fixed to different files into a single rule to search', () => {
+    withManager((m, root) => {
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recovery.ts'));
+      const first = active(m)[0]!;
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recovers.ts', 's2'), 's2');
+
+      const [rule, ...rest] = active(m);
+      expect(rest).toHaveLength(0);
+      expect(rule!.text).toBe(
+        '`src/core/recover.ts` does not exist; search for the file before opening it (it has been several different files).',
+      );
+      // How many files it has been is a measurement, and would be false at the next one (invariant 28).
+      expect(rule!.text).not.toMatch(/\d/);
+      expect(rule!.fields).toMatchObject({
+        ambiguous: true,
+        absent_references: ['src/core/recover.ts'],
+        candidates: ['src/core/recovery.ts', 'src/core/recovers.ts'],
+      });
+      // Only the missing path is a claim the staleness check may act on.
+      expect(rule!.fields.references).toBeUndefined();
+      // The single-file rule is retired by supersede, not deleted.
+      expect(m.store.getItem(first.id)).toMatchObject({ status: 'superseded', superseded_by: rule!.id });
+      expect(m.store.replay().items.find((i) => i.id === rule!.id)?.text).toBe(rule!.text);
+    });
+  });
+
+  it('collapses within one batch too, as attach delivers a transcript', () => {
+    withManager((m, root) => {
+      const records = [...pair(root, 'src/core/recover.ts', 'src/core/recovery.ts'), ...pair(root, 'src/core/recover.ts', 'src/core/recovers.ts')];
+      m.ingestOnly('claude', records, { sessionId: 's1', cwd: root });
+      expect(active(m).map((i) => i.fields.ambiguous)).toEqual([true]);
+    });
+  });
+
+  it('revalidates the collapsed rule on a further file instead of adding one', () => {
+    withManager((m, root) => {
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recovery.ts'));
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recovers.ts'));
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recoverx.ts'));
+      const [rule, ...rest] = active(m);
+      expect(rest).toHaveLength(0);
+      expect(rule!.fields.candidates).toEqual(['src/core/recovery.ts', 'src/core/recovers.ts', 'src/core/recoverx.ts']);
+    });
+  });
+
+  it('revalidates a rule seen again, and gathers its evidence', () => {
+    withManager((m, root) => {
+      ingestEach(m, pair(root, 'src/fold.js', 'src/fold.ts'));
+      const rule = active(m)[0]!;
+      expect(rule.evidence).toHaveLength(2);
+      // Pretend it was last confirmed long ago.
+      m.store.db.prepare(`UPDATE memory_items SET last_validated_at = ? WHERE id = ?`).run('2020-01-01T00:00:00.000Z', rule.id);
+
+      ingestEach(m, pair(root, 'src/fold.js', 'src/fold.ts', 's2'), 's2');
+      const again = m.store.getItem(rule.id)!;
+      expect(active(m)).toHaveLength(1);
+      expect(again.evidence).toHaveLength(4);
+      expect(again.last_validated_at! > '2025-01-01').toBe(true);
+    });
+  });
+
+  it('fades after three weeks unseen, stale rather than deleted, and revives when seen again', () => {
+    withManager((m, root) => {
+      ingestEach(m, pair(root, 'src/fold.js', 'src/fold.ts'));
+      const rule = active(m)[0]!;
+      expect(rule.ttl_seconds).toBe(21 * 86_400);
+      expect(m.decay(Date.now() + 20 * 86_400_000)).toBe(0);
+      expect(m.decay(Date.now() + 22 * 86_400_000)).toBe(1);
+      expect(m.store.getItem(rule.id)!.status).toBe('stale');
+
+      ingestEach(m, pair(root, 'src/fold.js', 'src/fold.ts', 's2'), 's2');
+      expect(recoveries(m)).toHaveLength(1);
+      expect(m.store.getItem(rule.id)!.status).toBe('active');
+      expect(m.store.replay().items.find((i) => i.id === rule.id)?.status).toBe('active');
+    });
+  });
+
+  it('revalidates a command rule seen again', () => {
+    withManager((m) => {
+      const retry = (n: number) => [
+        call(`c${n}a`, 'Bash', { command: 'npm run tests' }),
+        result(`c${n}a`, 'Exit code 1\nnpm error Missing script: "tests"', true),
+        call(`c${n}b`, 'Bash', { command: 'npm run test' }),
+        result(`c${n}b`, 'all green, nothing else to say here\n'),
+      ];
+      ingestEach(m, retry(1));
+      const rule = recoveries(m)[0]!;
+      ingestEach(m, retry(2));
+      expect(recoveries(m)).toHaveLength(1);
+      expect(m.store.getItem(rule.id)!.evidence).toHaveLength(4);
+    });
+  });
+
+  it('serves a few learned command rules in the bootstrap, most recently confirmed first, after what was stated', () => {
+    withManager((m) => {
+      const rules = Array.from({ length: 8 }, (_, n) => ({
+        id: `rule${n}`,
+        category: 'conventions' as const,
+        text: `\`tool${n} --bad\` fails (unknown option); use \`tool${n} --good\`.`,
+        source: 'deterministic' as const,
+        importance: 'medium' as const,
+        confidence: 0.7,
+        tags: ['recovery'],
+        fields: { recovery: 'command', failed_command: `tool${n} --bad`, command: `tool${n} --good` },
+      }));
+      const stated = { id: 'conv', category: 'conventions' as const, text: 'Relative imports carry the .js extension.', confidence: 0.8 };
+      expect(m.store.commitPatch({ add: [...rules, stated] }, 'deterministic').ok).toBe(true);
+      // rule0 was confirmed most recently, rule7 longest ago.
+      rules.forEach((r, n) => {
+        const at = new Date(Date.UTC(2026, 5, 30 - n)).toISOString();
+        m.store.db.prepare(`UPDATE memory_items SET last_validated_at = ? WHERE id = ?`).run(at, r.id);
+      });
+
+      const built = m.bootstrapContext();
+      const section = built.sections.find((s) => s.title === 'Active constraints')!;
+      expect(section.itemIds).toEqual(['conv', 'rule0', 'rule1', 'rule2', 'rule3', 'rule4']);
+      expect(section.dropped).toBe(3);
+      // The rest are named as one query away, not silently lost.
+      expect(built.text).toContain('memory_query category="conventions"');
+    });
+  });
+
+  it('never collapses a rule a person made protected', () => {
+    withManager((m, root) => {
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recovery.ts'));
+      const rule = active(m)[0]!;
+      m.store.db.prepare(`UPDATE memory_items SET source = 'user', importance = 'critical' WHERE id = ?`).run(rule.id);
+
+      ingestEach(m, pair(root, 'src/core/recover.ts', 'src/core/recovers.ts'));
+      expect(m.store.getItem(rule.id)!.status).toBe('active');
+      // The fold cannot see the protected rule, so what it learns stands beside it, unmerged.
+      expect(active(m).map((i) => i.text).sort()).toEqual([
+        '`src/core/recover.ts` does not exist; the file is `src/core/recovers.ts`.',
+        '`src/core/recover.ts` does not exist; the file is `src/core/recovery.ts`.',
+      ]);
+    });
+  });
+});
