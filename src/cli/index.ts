@@ -758,17 +758,38 @@ program
   .command('conflicts')
   .description('show contradictions currently sitting in memory (no model call)')
   .option('--limit <n>', 'maximum pairs', '20')
+  .option('--all', 'include pairs already judged compatible', false)
+  .option('--dismiss <ids...>', 'mark one pair (two ids) as compatible; it returns if either item changes')
+  .option('--reason <why>', 'with --dismiss: why they do not conflict')
+  .option('--forget-reviews', 'report every detected pair again, reviewed or not', false)
   .option('--json', 'machine-readable output', false)
   .action((opts, cmd) => {
     const m = manager(cmd);
     try {
-      const conflicts = m.conflicts({ maxPairs: Number(opts.limit) });
+      if (opts.dismiss) {
+        const ids = opts.dismiss as string[];
+        if (ids.length !== 2) {
+          out('--dismiss takes exactly two item ids');
+          process.exitCode = 1;
+          return;
+        }
+        const ok = m.dismissConflict(ids[0]!, ids[1]!, (opts.reason as string | undefined) ?? 'dismissed by hand');
+        out(ok ? `dismissed ${ids.join(' / ')}; it comes back if either item changes` : `no detected contradiction between ${ids.join(' and ')}`);
+        if (!ok) process.exitCode = 1;
+        return;
+      }
+      if (opts.forgetReviews === true) {
+        out(`forgot ${m.store.clearConflictReviews()} review(s)`);
+        return;
+      }
+      const conflicts = m.conflicts({ maxPairs: Number(opts.limit), includeReviewed: opts.all === true });
       if (opts.json) {
         out(JSON.stringify(conflicts, null, 2));
         return;
       }
       if (conflicts.length === 0) {
-        out('no contradictions detected');
+        const quiet = m.conflicts({ maxPairs: 500, includeReviewed: true }).length;
+        out(quiet > 0 ? `no open contradictions (${quiet} pair(s) already judged compatible; --all shows them)` : 'no contradictions detected');
         return;
       }
       for (const [n, c] of conflicts.entries()) {
@@ -782,7 +803,7 @@ program
         }
         out('');
       }
-      out(`run "contextd reconcile" to have a worker resolve these`);
+      out(`run "contextd reconcile" to have a worker resolve these, or "contextd conflicts --dismiss <a> <b>" if they do not conflict`);
     } finally {
       m.close();
     }

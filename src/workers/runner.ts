@@ -9,7 +9,7 @@ import { getProvider, ProviderError, type Provider } from './providers/index.js'
 import { providerIsLocal } from './providers/types.js';
 import { buildLearnPrompt, buildRepairPrompt } from './prompts.js';
 import { advanceWatermark, buildLearnInput, restrictLearnPatch } from './learn.js';
-import { detectConflicts } from '../core/conflicts.js';
+import { detectConflicts, withoutReviewed, type Conflict } from '../core/conflicts.js';
 import {
   buildConflictsPrompt,
   buildEventsPrompt,
@@ -48,6 +48,8 @@ interface Batch {
   eventCount: number;
   /** `episodes` tasks: the only ids a lesson may cite, and where the session watermark moves. */
   learn?: { evidenceIds: Set<string>; sessionId: string; until: string };
+  /** `conflicts` tasks: the pairs shown, marked reviewed once the worker has answered for them. */
+  conflicts?: Conflict[];
 }
 
 export interface RunOutcome {
@@ -218,6 +220,8 @@ export class WorkerRunner {
           // memory stays empty. They remain in L2, so `inspect` can still reach them.
           this.store.markInert(forModel.map((e) => e.id));
           if (batch.learn) advanceWatermark(this.store, batch.learn.sessionId, batch.learn.until);
+          // Nothing to change about any pair: each was judged compatible as it reads now.
+          if (batch.conflicts) this.store.markConflictsReviewed(batch.conflicts, `worker:${spec.model}`, 'no change needed');
           return this.outcome('noop', 'worker_returned_empty_patch', {
             version,
             eventsProcessed: forModel.length,
@@ -242,6 +246,9 @@ export class WorkerRunner {
           });
           this.store.markProcessed(forModel.map((e) => e.id));
           if (batch.learn) advanceWatermark(this.store, batch.learn.sessionId, batch.learn.until);
+          // Marked with the fingerprints the worker saw: a pair it edited no longer matches and is
+          // detected afresh; a pair it left alone it judged compatible.
+          if (batch.conflicts) this.store.markConflictsReviewed(batch.conflicts, `worker:${spec.model}`, 'reviewed with a patch');
           return this.outcome('ok', 'patch_applied', {
             version: commit.version,
             eventsProcessed: batch.learn ? batch.eventCount : forModel.length,
@@ -334,11 +341,12 @@ export class WorkerRunner {
     }
 
     if (definition.input === 'conflicts') {
-      const conflicts = detectConflicts(state.items, {
-        maxPairs: this.opts.maxConflictPairs ?? 8,
-      });
+      // A pair already judged compatible is not asked about again until one of its items changes.
+      const reviews = this.store.conflictReviews();
+      const max = this.opts.maxConflictPairs ?? 8;
+      const conflicts = withoutReviewed(detectConflicts(state.items, { maxPairs: max + reviews.size }), reviews).slice(0, max);
       if (conflicts.length === 0) return null;
-      return { prompt: buildConflictsPrompt(state, conflicts), events: [], eventCount: 0 };
+      return { prompt: buildConflictsPrompt(state, conflicts), events: [], eventCount: 0, conflicts };
     }
 
     // 'memory': the whole active memory, capped so one run cannot blow the context.

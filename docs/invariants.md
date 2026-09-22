@@ -366,6 +366,15 @@ Breaking one of these breaks a PRD guarantee, so change them deliberately or not
     Without these the worker's own session would be ingested as the person's work. Not `--bare`:
     it never reads OAuth, so it needs the API key this provider exists to do without.
 
+65. **A contradiction judged compatible stays quiet while both items read the same.** Detection is
+    lexical and has false positives by construction; a worker that answers for a pair with nothing
+    has judged it. `conflict_reviews` keys each pair by a fingerprint of both items' text, category,
+    status and importance, so an edit to either reopens it - the review is about those two
+    statements, not those two ids. Only a finished worker run (`ok` or `noop`) or a person
+    (`conflicts --dismiss`) records one; a failed run marks nothing. It is not memory and not in
+    the patch log: losing it only means asking again. Before it, one false positive at similarity
+    0.20 asked for the same model call on every `conflicts`, `doctor` and dashboard refresh.
+
 ## Metrics, in full
 
 K1 is reported as three numbers, not one: `token_reduction` (the cheap ratio), `coverage` and

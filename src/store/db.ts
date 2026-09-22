@@ -215,6 +215,17 @@ CREATE TABLE IF NOT EXISTS ingest_cursors (
   offset     INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+
+-- Contradiction pairs already judged compatible, keyed by the content of both items: an edit to
+-- either one changes the fingerprint and the pair is reported again. Not memory - a record of
+-- what detection need not ask about twice - so it is outside the patch log.
+CREATE TABLE IF NOT EXISTS conflict_reviews (
+  pair        TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  reviewed_by TEXT NOT NULL,
+  reason      TEXT,
+  reviewed_at TEXT NOT NULL
+);
 `;
 
 export function openDb(path: string): Db {

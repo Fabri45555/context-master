@@ -290,3 +290,63 @@ describe('conflict resolution worker', () => {
     }
   });
 });
+
+describe('reviewed pairs', () => {
+  const pair = [
+    { id: 'mem_x', category: 'decisions' as const, text: 'Use Redis for refresh token storage', importance: 'high' as const },
+    { id: 'mem_y', category: 'decisions' as const, text: 'Do not use Redis for refresh token storage', importance: 'high' as const },
+  ];
+
+  it('a pair the worker answered for with nothing is not reported again - until an item changes', async () => {
+    const provider = new ScriptedProvider([JSON.stringify({})]);
+    const { manager, cleanup } = makeManager({}, provider);
+    try {
+      manager.remember({ add: pair });
+      expect(manager.conflicts()).toHaveLength(1);
+
+      const outcomes = await manager.reconcile();
+      expect(outcomes.map((o) => o.status)).toEqual(['noop']);
+      expect(provider.calls).toHaveLength(1);
+      // Judged compatible: quiet, and not sent to a model again.
+      expect(manager.conflicts()).toHaveLength(0);
+      expect(manager.conflicts({ includeReviewed: true })).toHaveLength(1);
+      expect(await manager.reconcile()).toEqual([]);
+      expect(provider.calls).toHaveLength(1);
+
+      // An edit to either item is a new statement, so the pair is live again.
+      const r = manager.store.commitPatch({ update: [{ id: 'mem_y', text: 'Do not use Redis for refresh token storage in production' }] }, 'user', {});
+      expect(r.ok).toBe(true);
+      expect(manager.conflicts()).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('a failed worker run marks nothing', async () => {
+    const provider = new ScriptedProvider([new Error('provider down'), new Error('provider down')]);
+    const { manager, cleanup } = makeManager({}, provider);
+    try {
+      manager.remember({ add: pair });
+      const runner = new WorkerRunner(manager.store, manager.config, { provider });
+      const outcome = await runner.runOnce(null, 'conflict_resolution');
+      expect(['error', 'deferred', 'invalid']).toContain(outcome.status);
+      expect(manager.conflicts()).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('can be dismissed by hand, and every review forgotten', () => {
+    const { manager, cleanup } = makeManager();
+    try {
+      manager.remember({ add: pair });
+      expect(manager.dismissConflict('mem_y', 'mem_x', 'different environments')).toBe(true);
+      expect(manager.conflicts()).toHaveLength(0);
+      expect(manager.dismissConflict('mem_x', 'nope', 'x')).toBe(false);
+      expect(manager.store.clearConflictReviews()).toBe(1);
+      expect(manager.conflicts()).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
+  });
+});

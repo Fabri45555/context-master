@@ -1,3 +1,4 @@
+import { contentHash } from './ids.js';
 import { importanceRank } from './events.js';
 import { isLive, type MemoryCategory, type MemoryItem } from './state.js';
 
@@ -219,13 +220,30 @@ export function detectConflicts(items: MemoryItem[], opts: DetectOptions = {}): 
   return conflicts.slice(0, maxPairs);
 }
 
-function pairKey(a: string, b: string): string {
-  return a < b ? `${a}|${b}` : `${b}|${a}`;
-}
-
 function newerOf(a: MemoryItem, b: MemoryItem): string {
   const ta = Date.parse(a.created_at);
   const tb = Date.parse(b.created_at);
   if (!Number.isFinite(ta) || !Number.isFinite(tb)) return b.id;
   return ta >= tb ? a.id : b.id;
+}
+
+/**
+ * A reviewed pair stays quiet only while both items say what they said when it was reviewed.
+ *
+ * Detection is lexical and cannot tell "the same subject" from "a contradiction", so some pairs
+ * are false positives by construction; a worker that returns nothing for them has judged them
+ * compatible. Without a record of that, the same pair was reported - and the same model call
+ * suggested - on every `conflicts`, `doctor` and dashboard refresh, for ever.
+ */
+export function pairKey(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+export function pairFingerprint(a: MemoryItem, b: MemoryItem): string {
+  const [x, y] = a.id < b.id ? [a, b] : [b, a];
+  return contentHash([x.id, x.text, x.category, x.status, x.importance, y.id, y.text, y.category, y.status, y.importance]);
+}
+
+export function withoutReviewed(conflicts: Conflict[], reviewed: ReadonlyMap<string, string>): Conflict[] {
+  return conflicts.filter((c) => reviewed.get(pairKey(c.a.id, c.b.id)) !== pairFingerprint(c.a, c.b));
 }

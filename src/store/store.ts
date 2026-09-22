@@ -1,3 +1,4 @@
+import { pairFingerprint, pairKey, type Conflict } from '../core/conflicts.js';
 import { newId } from '../core/ids.js';
 import type { EventDecision } from '../core/deterministic.js';
 import {
@@ -330,6 +331,26 @@ export class ContextStore {
       .prepare(`SELECT session_id, MAX(ts) AS last FROM events GROUP BY session_id ORDER BY last DESC LIMIT ?`)
       .all(limit) as Array<{ session_id: string }>;
     return rows.map((r) => r.session_id);
+  }
+
+  /** Pair key -> fingerprint of every contradiction pair judged compatible (see pairFingerprint). */
+  conflictReviews(): Map<string, string> {
+    const rows = this.db.prepare(`SELECT pair, fingerprint FROM conflict_reviews`).all() as Array<{ pair: string; fingerprint: string }>;
+    return new Map(rows.map((r) => [r.pair, r.fingerprint]));
+  }
+
+  markConflictsReviewed(conflicts: Conflict[], reviewedBy: string, reason: string | null = null): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO conflict_reviews (pair, fingerprint, reviewed_by, reason, reviewed_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(pair) DO UPDATE SET fingerprint = excluded.fingerprint, reviewed_by = excluded.reviewed_by,
+         reason = excluded.reason, reviewed_at = excluded.reviewed_at`,
+    );
+    const at = new Date().toISOString();
+    for (const c of conflicts) stmt.run(pairKey(c.a.id, c.b.id), pairFingerprint(c.a, c.b), reviewedBy, reason, at);
+  }
+
+  clearConflictReviews(): number {
+    return this.db.prepare(`DELETE FROM conflict_reviews`).run().changes;
   }
 
   /**

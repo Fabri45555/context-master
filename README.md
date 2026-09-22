@@ -399,6 +399,19 @@ shell is refused:
 contextd forget mem_0mucgeiti1db922250a --reason "duplicate of mem_0mucgeift9687811391" --protected
 ```
 
+### Contradictions that are not
+
+Detection is lexical, so some pairs only share a subject. When `contextd reconcile` has a worker
+look at a pair and it changes nothing, the pair is recorded as compatible and stops being reported
+— by `conflicts`, `doctor`, the dashboard and `memory_conflicts` — until either item is edited. You
+can do the same by hand:
+
+```bash
+contextd conflicts --dismiss d4 mem_0mu8kst6yf3934e9097 --reason "different subsystems"
+contextd conflicts --all             # including the ones judged compatible
+contextd conflicts --forget-reviews  # report everything again
+```
+
 ### Knowing when to /clear
 
 contextd does not trim the agent's window — cutting it turn by turn would throw away the prompt
@@ -607,7 +620,7 @@ contextd projects clear --yes       # empty it; projects come back on their next
 | `replay` | Rebuild state from the patch log | `--verify`, `--version <n>` |
 | `compact` | Drain the pending queue through workers now | `--session`, `--task`, `--max-runs` |
 | `lifecycle` | Where the session sits on the compaction ladder | `--act`, `--session`, `--max-runs` |
-| `conflicts` | Contradictions in memory, found without a model | `--limit`, `--json` |
+| `conflicts` | Contradictions in memory, found without a model | `--limit`, `--json`, `--all`, `--dismiss <a> <b>`, `--reason`, `--forget-reviews` |
 | `reconcile` | Have a worker resolve contradictions | `--restructure`, `--no-conflicts`, `--max-runs` |
 | `graph [id]` | Typed relations between memory items | `--json` |
 | `embed` | Build the optional semantic index | `--limit`, `--all` |

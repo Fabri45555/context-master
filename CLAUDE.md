@@ -127,6 +127,7 @@ one are in [docs/invariants.md](docs/invariants.md) — read the entry before ch
 62. **Advice about the context goes to the person, never into it** (`clearAdvice`, `systemMessage`), once per level.
 63. **A status line someone had is never lost:** settings.local.json only; `--chain` keeps it, uninstall restores it.
 64. **A worker on Claude Code is not a session:** `--safe-mode`, no tools, `CONTEXTD_WORKER=1` makes the hook exit.
+65. **A contradiction judged compatible stays quiet while both items read the same** (`conflict_reviews`, fingerprinted).
 
 ## Conventions
 

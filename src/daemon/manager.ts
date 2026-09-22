@@ -10,7 +10,7 @@ import {
   clearAdvice,
   type ClearAdvice,
 } from '../core/lifecycle.js';
-import { detectConflicts, type Conflict } from '../core/conflicts.js';
+import { detectConflicts, withoutReviewed, type Conflict } from '../core/conflicts.js';
 import { estimateTokens } from '../core/events.js';
 import type { StatePatch } from '../core/patch.js';
 import { collectMetrics, type Metrics } from '../metrics/index.js';
@@ -424,10 +424,26 @@ export class ContextManager {
    * PRD 44 - the contradictions currently sitting in memory, found deterministically.
    * Cheap enough to call before deciding whether a model is worth spending on.
    */
-  conflicts(opts: { maxPairs?: number } = {}): Conflict[] {
-    return detectConflicts(this.store.currentState().items, {
-      ...(opts.maxPairs != null ? { maxPairs: opts.maxPairs } : {}),
-    });
+  /**
+   * Contradictions worth someone's attention: detected pairs, minus those already judged compatible
+   * while both items still read the same (`withoutReviewed`). `includeReviewed` shows them all.
+   */
+  conflicts(opts: { maxPairs?: number; includeReviewed?: boolean } = {}): Conflict[] {
+    const max = opts.maxPairs ?? 20;
+    const reviews = opts.includeReviewed ? new Map<string, string>() : this.store.conflictReviews();
+    // Detect past the cap by as many pairs as were reviewed, so a quiet pair does not hide a live one.
+    const found = detectConflicts(this.store.currentState().items, { maxPairs: max + reviews.size });
+    return withoutReviewed(found, reviews).slice(0, max);
+  }
+
+  /** Mark pairs as compatible by hand (`contextd conflicts --dismiss`). */
+  dismissConflict(a: string, b: string, reason: string): boolean {
+    const pair = this.conflicts({ includeReviewed: true, maxPairs: 500 }).find(
+      (c) => (c.a.id === a && c.b.id === b) || (c.a.id === b && c.b.id === a),
+    );
+    if (!pair) return false;
+    this.store.markConflictsReviewed([pair], 'user', reason);
+    return true;
   }
 
   /**
