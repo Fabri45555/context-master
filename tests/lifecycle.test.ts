@@ -163,7 +163,7 @@ describe('the ladder in the manager', () => {
       expect(assessment.stage).toBe('reduce');
       // The hook path is synchronous for the agent, so no provider may be called from it.
       expect(provider.calls).toHaveLength(0);
-      expect(performed.map((p) => p.action)).toEqual(['fold', 'decay', 'prune']);
+      expect(performed.map((p) => p.action)).toEqual(['fold', 'decay', 'verify_refs', 'prune']);
       expect(skipped).toContain('reconcile');
     } finally {
       cleanup();

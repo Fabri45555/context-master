@@ -2,6 +2,7 @@ import type { StoredEvent } from '../store/store.js';
 import type { StatePatch, AddItem } from './patch.js';
 import { isSuccessfulMilestone, looksLikeError } from './importance.js';
 import { isSensitivePath } from './redact.js';
+import { collectAttempts, findRecoveries, type Recovery } from './recovery.js';
 
 /**
  * PRD 13 - the deterministic fold.
@@ -25,13 +26,32 @@ export interface FoldResult {
   inert: string[];
 }
 
-export function deterministicFold(events: StoredEvent[]): FoldResult {
+/**
+ * What the fold may see beyond its own batch. Everything here is optional and read-only: the
+ * fold stays a pure function of its inputs.
+ */
+export interface FoldContext {
+  /**
+   * Earlier events of the batch's sessions, oldest first, excluding the batch itself. On the
+   * hook path every batch is a single event, so without this a failure and the success that
+   * recovers from it would never be seen together.
+   */
+  history?: StoredEvent[];
+  /** The active, unprotected known issue recorded from this failure event, if any. */
+  issueForEvent?: (eventId: string) => string | null;
+  /** Project root: a recovery rule is only about paths inside it. */
+  root?: string | null;
+}
+
+export function deterministicFold(events: StoredEvent[], ctx: FoldContext = {}): FoldResult {
   const working: NonNullable<StatePatch['working']> = {};
   const add: AddItem[] = [];
   const fileNotes: FoldResult['fileNotes'] = [];
   const consumed: string[] = [];
   const inert: string[] = [];
   const notes: string[] = [];
+  /** Known issues this batch records, by the failure they came from - a recovery may replace one. */
+  const issueOfEvent = new Map<string, AddItem>();
 
   /**
    * Which call produced which result.
@@ -123,7 +143,7 @@ export function deterministicFold(events: StoredEvent[]): FoldResult {
           break;
         }
         if (text) {
-          add.push({
+          const issue: AddItem = {
             category: 'known_issues',
             text: text.slice(0, 500),
             importance: 'high',
@@ -133,7 +153,9 @@ export function deterministicFold(events: StoredEvent[]): FoldResult {
             reason: 'error observed during the session; unverified as still present',
             ttl_seconds: 86_400,
             tags: ['unverified'],
-          });
+          };
+          add.push(issue);
+          issueOfEvent.set(e.id, issue);
           notes.push('error_recorded');
           // Consumed here so the same error cannot also be recorded by a worker later. A
           // worker can still supersede this item once it understands the cause.
@@ -151,7 +173,7 @@ export function deterministicFold(events: StoredEvent[]): FoldResult {
             inert.push(e.id);
             break;
           }
-          add.push({
+          const issue: AddItem = {
             category: 'known_issues',
             text: `Command failed (exit ${code}): ${cmd}`,
             fields: { command: cmd, exit_code: code, output_excerpt: out.slice(0, 400) },
@@ -162,7 +184,9 @@ export function deterministicFold(events: StoredEvent[]): FoldResult {
             reason: 'non-zero exit status',
             ttl_seconds: 86_400,
             tags: ['unverified'],
-          });
+          };
+          add.push(issue);
+          issueOfEvent.set(e.id, issue);
           consumed.push(e.id);
           notes.push('command_failed');
         } else if (isSuccessfulMilestone(e)) {
@@ -181,12 +205,91 @@ export function deterministicFold(events: StoredEvent[]): FoldResult {
     }
   }
 
+  const learned = learnRecoveries(events, ctx);
+  for (const r of learned) {
+    const failedId = r.failed.resultEventId;
+    const sameBatchIssue = issueOfEvent.get(failedId);
+    // The failure was recorded as an issue in this very batch: the fix arrived with it, so the
+    // issue is never written rather than written and retired.
+    if (sameBatchIssue) add.splice(add.indexOf(sameBatchIssue), 1);
+    const olderIssue = sameBatchIssue ? null : (ctx.issueForEvent?.(failedId) ?? null);
+    add.push(recoveryItem(r, olderIssue));
+    notes.push(r.kind === 'path' ? 'path_recovery' : 'command_recovery');
+    // Both ends are now evidence of derived state. The failure is only re-classified when it is
+    // in this batch; an older one keeps whatever status it was closed with.
+    consumed.push(r.success.resultEventId);
+    if (inert.includes(failedId)) consumed.push(failedId);
+  }
+  if (learned.length > 0) {
+    // A success the fold had closed as inert (a plain exit 0) is now what state was derived from.
+    const derived = new Set(consumed);
+    const stillInert = inert.filter((id) => !derived.has(id));
+    inert.length = 0;
+    inert.push(...stillInert);
+  }
+
   const patch: StatePatch = {};
   if (Object.keys(working).length > 0) patch.working = working;
   if (add.length > 0) patch.add = add;
   if (notes.length > 0) patch.note = `deterministic fold: ${[...new Set(notes)].join(', ')}`;
 
   return { patch, fileNotes, consumed, inert };
+}
+
+function learnRecoveries(events: StoredEvent[], ctx: FoldContext): Recovery[] {
+  const hasOutcome = events.some(
+    (e) => e.type === 'TOOL_RESULT' || e.type === 'COMMAND_EXECUTED',
+  );
+  if (!hasOutcome) return [];
+  const sessions = new Set(events.map((e) => e.session_id));
+  const seen = new Set(events.map((e) => e.id));
+  // History is filtered to the batch's sessions here too: a recovery never pairs across sessions,
+  // whatever the caller passed.
+  const history = (ctx.history ?? []).filter((e) => sessions.has(e.session_id) && !seen.has(e.id));
+  const attempts = collectAttempts([...history, ...events], ctx.root ?? null);
+  return findRecoveries(attempts, seen, { isScratchCommand, isHarnessError });
+}
+
+/**
+ * The durable rule a recovery teaches.
+ *
+ * A wrong path is a fact about the repository's layout, so it is a `discoveries` item: served
+ * by query when the agent works near that file, not taxed on every bootstrap. A command that does
+ * not work here, and the one that does, is how this project is operated - a `conventions` item,
+ * which the bootstrap serves, because the agent will not think to query before running it.
+ */
+function recoveryItem(r: Recovery, supersedes: string | null): AddItem {
+  const evidence = [r.failed.resultEventId, r.success.resultEventId];
+  const base = {
+    text: r.text,
+    importance: 'medium' as const,
+    confidence: 0.7,
+    source: 'deterministic' as const,
+    evidence,
+    tags: ['recovery'],
+    ...(supersedes ? { supersedes: [supersedes] } : {}),
+  };
+  if (r.kind === 'path') {
+    return {
+      ...base,
+      category: 'discoveries',
+      reason: 'a call on the first path failed as not found; the same call on the second succeeded',
+      // What must hold for the rule to stay true: the right file exists and the wrong one does not.
+      // The staleness check reads these instead of the text, which names the missing path on purpose.
+      fields: { recovery: 'path', references: [r.success.key], absent_references: [r.failed.key] },
+    };
+  }
+  return {
+    ...base,
+    category: 'conventions',
+    reason: 'the first command failed as malformed; a related retry succeeded',
+    fields: {
+      recovery: 'command',
+      failed_command: r.failed.key,
+      command: r.success.key,
+      ...(r.errorClass ? { error_class: r.errorClass } : {}),
+    },
+  };
 }
 
 /**

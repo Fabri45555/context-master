@@ -1,7 +1,7 @@
 import type { Adapter, AdapterContext } from '../adapters/index.js';
 import type { Config } from '../core/config.js';
 import { DeterministicEngine } from '../core/deterministic.js';
-import { deterministicFold } from '../core/fold.js';
+import { deterministicFold, type FoldContext } from '../core/fold.js';
 import { IgnoreMatcher } from '../core/ignore.js';
 import type { ContextStore, StoredEvent } from '../store/store.js';
 
@@ -44,7 +44,7 @@ export class IngestPipeline {
   constructor(
     private store: ContextStore,
     private config: Config,
-    projectRoot: string,
+    private projectRoot: string,
   ) {
     const ignore = IgnoreMatcher.fromProject(
       projectRoot,
@@ -142,7 +142,7 @@ export class IngestPipeline {
   refold(sessionId: string | null, limit = 500): { folded: number } {
     const pending = this.store.pendingEvents(sessionId, limit);
     if (pending.length === 0) return { folded: 0 };
-    const result = deterministicFold(pending);
+    const result = deterministicFold(pending, this.foldContext(pending));
 
     for (const f of result.fileNotes) this.store.noteFile(f.path, f.contentHash);
     if (Object.keys(result.patch).length > 0) {
@@ -154,6 +154,26 @@ export class IngestPipeline {
   }
 
   /**
+   * What the fold may look back at: the session's recent tool traffic, so a success can be paired
+   * with the failure it recovers from even when the two arrived in different batches.
+   */
+  private foldContext(events: StoredEvent[]): FoldContext {
+    const ids = events.map((e) => e.id);
+    const history: StoredEvent[] = [];
+    // Only a batch that carries an outcome can complete a recovery; skip the query otherwise.
+    if (events.some((e) => e.type === 'TOOL_RESULT' || e.type === 'COMMAND_EXECUTED')) {
+      for (const sid of new Set(events.map((e) => e.session_id))) {
+        history.push(...this.store.recentToolEvents(sid, ids));
+      }
+    }
+    return {
+      history,
+      issueForEvent: (id) => this.store.issueRecordedFrom(id),
+      root: this.projectRoot,
+    };
+  }
+
+  /**
    * PRD 13 - the deterministic pass, run at ingest rather than inside the worker.
    *
    * Doing it here means it still happens when no worker can run at all: no budget, no
@@ -162,7 +182,7 @@ export class IngestPipeline {
    */
   private fold(events: StoredEvent[], stats: IngestStats): void {
     if (events.length === 0) return;
-    const result = deterministicFold(events);
+    const result = deterministicFold(events, this.foldContext(events));
 
     for (const f of result.fileNotes) this.store.noteFile(f.path, f.contentHash);
 
