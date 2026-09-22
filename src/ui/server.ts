@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { collectBenefits } from '../metrics/benefits.js';
+import { collectHistory } from '../metrics/history.js';
 import { collectMetrics } from '../metrics/index.js';
 import { MEMORY_CATEGORIES } from '../core/state.js';
 import { diagnose, worstStatus } from '../daemon/doctor.js';
@@ -114,18 +115,25 @@ async function handle(
       }
 
       case '/api/overview':
-        send(res, 200, overview(manager));
+        send(res, 200, overview(manager, scopeOf(manager, url)));
         return;
 
       case '/api/benefits': {
-        const metrics = collectMetrics(manager.store, manager.config, null);
+        const scope = scopeOf(manager, url);
+        const sessionId = scope.session?.id ?? null;
+        const metrics = collectMetrics(manager.store, manager.config, sessionId);
         send(res, 200, {
           root: manager.projectRoot,
+          scope,
           metrics,
-          benefits: collectBenefits(manager.store, manager.config, metrics, manager.projectRoot),
+          benefits: collectBenefits(manager.store, manager.config, metrics, manager.projectRoot, sessionId),
         });
         return;
       }
+
+      case '/api/history':
+        send(res, 200, collectHistory(manager.store, manager.config, manager.projectRoot));
+        return;
 
       case '/api/health': {
         // The same checks as `contextd doctor`, so the pill and the CLI can never disagree.
@@ -181,9 +189,26 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function overview(manager: ContextManager) {
-  const metrics = collectMetrics(manager.store, manager.config, null);
+type Scope = {
+  kind: 'all' | 'session';
+  /** The latest session when kind is 'session'; null there means no session was ever observed. */
+  session: ReturnType<ContextManager['store']['listSessions']>[number] | null;
+};
+
+/**
+ * `?scope=session` narrows the figures that belong to a session to the latest one. Memory items,
+ * protection, precision and latency are project-wide whatever the scope - the page labels them so
+ * rather than inventing a per-session number.
+ */
+function scopeOf(manager: ContextManager, url: URL): Scope {
+  if (url.searchParams.get('scope') !== 'session') return { kind: 'all', session: null };
+  return { kind: 'session', session: manager.store.listSessions(1)[0] ?? null };
+}
+
+function overview(manager: ContextManager, scope: Scope = { kind: 'all', session: null }) {
+  const metrics = collectMetrics(manager.store, manager.config, scope.session?.id ?? null);
   return {
+    scope,
     project: manager.config.project.name ?? null,
     root: manager.projectRoot,
     root_display: shortenHome(manager.projectRoot),

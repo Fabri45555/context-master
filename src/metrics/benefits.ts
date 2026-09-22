@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { Config } from '../core/config.js';
 import type { ContextStore } from '../store/store.js';
 import type { Metrics } from './index.js';
+import { MIRROR_LABEL } from '../ops/mirror.js';
 
 /**
  * What contextd has bought this project, stated so that each number can be checked.
@@ -26,7 +27,10 @@ export interface Benefits {
   delivery: {
     total: number;
     bootstrap: number;
+    /** Targeted queries: every delivery that is neither a bootstrap nor a mirror copy. */
     query: number;
+    /** Bootstraps written into an instruction file (invariant 46): served, never a resume. */
+    mirror: number;
     empty: number;
     tokens_served: number;
     /**
@@ -86,21 +90,27 @@ export function collectBenefits(
   config: Config,
   m: Metrics,
   projectRoot: string | null = null,
+  sessionId: string | null = null,
 ): Benefits {
   const db = store.db;
   const one = <T>(sql: string): T => db.prepare(sql).get() as T;
 
-  const delivery = one<{ n: number; b: number; e: number; t: number }>(
-    `SELECT COUNT(*) n,
-            COALESCE(SUM(CASE WHEN query = '(bootstrap)' THEN 1 ELSE 0 END), 0) b,
-            COALESCE(SUM(CASE WHEN item_ids = '[]' THEN 1 ELSE 0 END), 0) e,
-            COALESCE(SUM(tokens), 0) t
-     FROM retrieval_log`,
-  );
-  const bootstraps = db
-    .prepare(`SELECT at, session_id, tokens FROM retrieval_log WHERE query = '(bootstrap)' AND item_ids <> '[]' ORDER BY at`)
-    .all() as Array<{ at: string; session_id: string | null; tokens: number }>;
-  const resumes = countResumes(bootstraps);
+  // Scoped to one session when asked. An MCP call's session is inferred (invariant 38), so a
+  // per-session delivery count is a label, good for reading, never for deciding anything.
+  const where = sessionId ? ' WHERE session_id = ?' : '';
+  const args = sessionId ? [sessionId] : [];
+  const delivery = db
+    .prepare(
+      `SELECT COUNT(*) n,
+              COALESCE(SUM(CASE WHEN query = '(bootstrap)' THEN 1 ELSE 0 END), 0) b,
+              COALESCE(SUM(CASE WHEN query = ? THEN 1 ELSE 0 END), 0) mi,
+              COALESCE(SUM(CASE WHEN item_ids = '[]' THEN 1 ELSE 0 END), 0) e,
+              COALESCE(SUM(tokens), 0) t
+       FROM retrieval_log${where}`,
+    )
+    .get(MIRROR_LABEL, ...args) as { n: number; b: number; mi: number; e: number; t: number };
+  const resumeList = resumesFrom(bootstrapServes(store, sessionId));
+  const resumes = resumeList.length;
 
   const peak = m.agent.peak_input_tokens;
   // The first version compared every delivery with the agent's 519k peak and printed 1.0M tokens
@@ -108,8 +118,12 @@ export function collectBenefits(
   // holds its context avoids nothing. What a resume without memory really costs is re-reading the
   // project's documents - and even that does not recover what the user asked for, which the
   // documents do not contain. So: count resumes only, and price them against the documents.
+  //
+  // Each resume is charged the bootstrap tokens it was actually served (retrieval_log records
+  // them), not today's bootstrap size: that is what lets the History view rebuild the running
+  // total from the log and end exactly here.
   const rebuild = rebuildBaseline(config, projectRoot);
-  const tokensAvoided = resumes * Math.max(0, rebuild.tokens - m.context.active_tokens);
+  const tokensAvoided = avoidedTokens(resumeList, rebuild.tokens);
   const rate = config.accounting.agent_input_cost_per_mtok;
 
   const notes = one<{ prov: number; inert: number }>(
@@ -142,7 +156,8 @@ export function collectBenefits(
     delivery: {
       total: delivery.n,
       bootstrap: delivery.b,
-      query: delivery.n - delivery.b,
+      query: delivery.n - delivery.b - delivery.mi,
+      mirror: delivery.mi,
       empty: delivery.e,
       tokens_served: delivery.t,
       resumes,
@@ -192,17 +207,55 @@ export function collectBenefits(
 /** Bootstrap deliveries this close together are one resume, served twice (hook and MCP). */
 const RESUME_WINDOW_MS = 10 * 60_000;
 
-export function countResumes(rows: Array<{ at: string; session_id: string | null }>): number {
-  let resumes = 0;
+export interface ResumeServe {
+  at: string;
+  session_id: string | null;
+  tokens: number;
+}
+
+/**
+ * Bootstrap serves that reached an agent, oldest first. The mirror copy is excluded by its label
+ * (invariant 46) and an empty bootstrap served nothing to resume from.
+ */
+export function bootstrapServes(store: ContextStore, sessionId: string | null = null): ResumeServe[] {
+  const where = sessionId ? ' AND session_id = ?' : '';
+  return store.db
+    .prepare(
+      `SELECT at, session_id, tokens FROM retrieval_log
+       WHERE query = '(bootstrap)' AND item_ids <> '[]'${where} ORDER BY at`,
+    )
+    .all(...(sessionId ? [sessionId] : [])) as ResumeServe[];
+}
+
+/**
+ * Serves grouped into resumes, each represented by the serve that opened it. The second serve of
+ * one resume (the hook, then `memory_bootstrap`) is the same context again, so it is not a second
+ * saving - and, as before, not a second cost either.
+ */
+export function resumesFrom<T extends { at: string }>(rows: T[]): T[] {
+  const out: T[] = [];
   let last: number | null = null;
   for (const r of rows) {
     const t = Date.parse(r.at);
     // Session ids are not compared: the MCP call carried none until recently, and a compaction
     // resumes the *same* session id. Time is what separates two resumes.
-    if (last == null || t - last > RESUME_WINDOW_MS) resumes += 1;
+    if (last == null || t - last > RESUME_WINDOW_MS) out.push(r);
     last = t;
   }
-  return resumes;
+  return out;
+}
+
+export function countResumes(rows: Array<{ at: string; session_id: string | null }>): number {
+  return resumesFrom(rows).length;
+}
+
+/** What one resume avoided: the documents it did not have to re-read, minus what it was served. */
+export function avoidedFor(serve: { tokens: number }, rebuildTokens: number): number {
+  return Math.max(0, rebuildTokens - serve.tokens);
+}
+
+export function avoidedTokens(resumes: Array<{ tokens: number }>, rebuildTokens: number): number {
+  return resumes.reduce((sum, r) => sum + avoidedFor(r, rebuildTokens), 0);
 }
 
 /**
@@ -212,7 +265,7 @@ export function countResumes(rows: Array<{ at: string; session_id: string | null
  * loads every session regardless. `accounting.rebuild_baseline_tokens` overrides it for a project
  * whose documentation is not where its context lives.
  */
-function rebuildBaseline(config: Config, root: string | null): { tokens: number; source: 'config' | 'documents' } {
+export function rebuildBaseline(config: Config, root: string | null): { tokens: number; source: 'config' | 'documents' } {
   const configured = config.accounting.rebuild_baseline_tokens;
   if (configured != null) return { tokens: configured, source: 'config' };
   if (!root) return { tokens: 0, source: 'documents' };

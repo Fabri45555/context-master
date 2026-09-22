@@ -151,6 +151,7 @@ export function renderPage(version = '', appVersion = ''): string {
   }
   .card-h { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
   .card-h h3 { margin: 0; font-size: 13px; font-weight: 600; }
+  .card-h h3 .chip { margin-left: 4px; font-weight: 400; vertical-align: 1px; }
   .card-h .meta { color: var(--muted); font-size: 12px; text-align: right; }
   .note { color: var(--muted); font-size: 12px; margin: 12px 0 0; }
 
@@ -158,6 +159,8 @@ export function renderPage(version = '', appVersion = ''): string {
   .kpi { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 15px 18px; }
   .kpi .l { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
   .kpi .v { font-size: 28px; font-weight: 600; line-height: 1.2; margin-top: 6px; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  .kpi .l .chip { text-transform: none; letter-spacing: 0; margin-left: 4px; }
+  .card-h .seg { flex: none; }
   .kpi .v small { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 4px; }
   .kpi .v.good { color: var(--good); }
   .kpi .s { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -367,7 +370,7 @@ export function renderPage(version = '', appVersion = ''): string {
 </main>
 <footer>
   <div class="foot-in">
-    <span>Press <kbd>R</kbd> to refresh · <kbd>1</kbd>–<kbd>4</kbd> switch views · <kbd>/</kbd> search memory</span>
+    <span>Press <kbd>R</kbd> to refresh · <kbd>1</kbd>–<kbd>4</kbd> switch views · <kbd>S</kbd> switch scope · <kbd>/</kbd> search memory</span>
     <a href="https://github.com/Fabri45555/context-master#readme" target="_blank" rel="noopener noreferrer">Documentation</a>
   </div>
 </footer>
@@ -394,7 +397,7 @@ const VIEWS = [
     ['context', 'Context preview', 'What an agent would be served for a query. A preview is not a retrieval: it records nothing.'],
   ] },
   { id: 'history', label: 'History',
-    caption: 'How memory use has developed, and the agent sessions it was built from.' },
+    caption: 'What memory has saved over time, how it has been used, and the agent sessions it was built from.' },
   { id: 'activity', label: 'Activity', subs: [
     ['events', 'Events', 'The most recent events observed from the agent, newest first. Click a row for the full preview.'],
     ['patches', 'Patch log', 'Every change to memory, newest first. The patch log is the source of truth; memory is its replay.'],
@@ -406,17 +409,40 @@ const LEGACY = {
   events: 'activity/events', patches: 'activity/patches', sessions: 'history', items: 'memory/items',
 };
 
+/*
+ * A view's own settings ride in the hash after a "?", so a refresh or a shared link keeps them:
+ * #overview?scope=session, #history?by=week. Only a non-default value is written, and a parameter
+ * a view does not know is dropped rather than carried along.
+ */
+const PARAMS = { overview: { scope: ['all', 'session'] }, history: { by: ['day', 'week'] } };
+
 function parseHash(h) {
-  let key = String(h || '').replace(/^#/, '');
+  const raw = String(h || '').replace(/^#/, '');
+  const qi = raw.indexOf('?');
+  const query = new URLSearchParams(qi >= 0 ? raw.slice(qi + 1) : '');
+  let key = qi >= 0 ? raw.slice(0, qi) : raw;
   key = LEGACY[key] || key;
   const parts = key.split('/');
   const view = VIEWS.find((x) => x.id === parts[0]) || VIEWS[0];
   const sub = view.subs ? (view.subs.find((x) => x[0] === parts[1]) || view.subs[0])[0] : null;
-  return { view: view.id, sub };
+  const q = {};
+  for (const [name, allowed] of Object.entries(PARAMS[view.id] || {})) {
+    const v = query.get(name);
+    q[name] = allowed.includes(v) ? v : allowed[0];
+  }
+  return { view: view.id, sub, q };
 }
 const keyOf = (r) => (r.sub ? r.view + '/' + r.sub : r.view);
+function hashOf(r) {
+  const spec = PARAMS[r.view] || {};
+  const extra = Object.keys(spec).filter((k) => r.q && r.q[k] && r.q[k] !== spec[k][0])
+    .map((k) => k + '=' + r.q[k]).join('&');
+  return keyOf(r) + (extra ? '?' + extra : '');
+}
 let route = parseHash(location.hash);
-if (location.hash && location.hash.slice(1) !== keyOf(route)) history.replaceState(null, '', '#' + keyOf(route));
+if (location.hash && location.hash.slice(1) !== hashOf(route)) history.replaceState(null, '', '#' + hashOf(route));
+// Settings of views left behind, so Overview → History → Overview comes back in the same scope.
+const viewParams = {};
 
 // ------------------------------------------------------------------ helpers
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -516,29 +542,67 @@ const STATUS_TONE = { in_progress: 'accent', blocked: 'bad', review: 'warn', don
 const ATTACH = 'contextd attach --adapter claude --transcript <file>';
 
 // ---------------------------------------------------------------- overview
-function nowCard(w) {
+function nowCard(w, pw) {
   if (!w || !w.current_task) {
     return card('Current task', empty('No task recorded. Set one so the next session starts from it:',
       'contextd task "<what you are doing>" --status in_progress'));
   }
   const status = w.task_status || 'unknown';
-  return card('Current task',
+  return card('Current task' + (pw || ''),
     '<div class="now"><div class="task">' + esc(w.current_task) + '</div>' +
     '<div>' + chip(status.replace('_', ' '), STATUS_TONE[status] || '') + '</div>' +
     (w.next_action ? '<div class="sub"><b>Next</b>' + esc(w.next_action) + '</div>' : '') + '</div>',
     'updated ' + when(w.updated_at) + ' · <a href="#memory/items">working memory</a>');
 }
 
+const SCOPES = [
+  ['session', 'Latest session', 'Figures for the most recent agent session only'],
+  ['all', 'All time', 'Figures across every session observed'],
+];
+/*
+ * Memory is the project's, not a session's: items, protection, precision, latency and the
+ * bootstrap are the same in either scope. In the session scope they carry this mark rather
+ * than a per-session number that would have to be invented.
+ */
+const projectMark = (on) => (on ? ' ' + chip('project-wide', '', 'Memory belongs to the project: the same in either scope') : '');
+
+let captionHtml = null;
+function setCaption(html) {
+  if (html === captionHtml) return;
+  captionHtml = html;
+  $('caption').innerHTML = html;
+}
+function scopeCaption(scope, sessions) {
+  if (scope.kind !== 'session') {
+    return 'What memory is worth to this project, and whether it is holding up. Every figure covers all ' +
+      plural(sessions, 'session') + '.';
+  }
+  const s = scope.session;
+  if (!s) return 'No agent session has been observed yet.';
+  const agent = s.agent && s.agent !== s.source ? esc(s.agent) + ' <span class="muted">via ' + esc(s.source) + '</span>' : esc(s.agent || s.source);
+  return 'Latest session ' + idTag(s.id) + ' · started ' + when(s.started_at) + ' · ' + agent + ' · ' +
+    (s.ended_at ? 'ended ' + when(s.ended_at) : 'open') + ' · ' + plural(s.events, 'event') +
+    '. Figures marked ' + chip('project-wide') + ' are the same in either scope.';
+}
+
 async function drawOverview() {
-  const [bd, d] = await Promise.all([get('/api/benefits'), get('/api/overview')]);
+  const session = route.q.scope === 'session';
+  const qs = session ? '?scope=session' : '';
+  const [bd, d] = await Promise.all([get('/api/benefits' + qs), get('/api/overview' + qs)]);
   const b = bd.benefits, m = d.metrics;
   const r = b.resume, dl = b.delivery, t = b.triage, pr = b.protection, c = b.continuity, q = b.quality;
   const p = m.lifecycle.pressure;
+  // The response says which scope it answers; a scope switched mid-fetch is caught by drawSeq.
+  setCaption(scopeCaption(d.scope, c.sessions));
+  if (session && !d.scope.session) {
+    return empty('No agent session observed yet. Install hooks so the next one is, or attach a transcript:', 'contextd init');
+  }
+  const pw = projectMark(session);
 
   let html = '<div class="kpis">';
   html += r.smaller_by != null
     ? kpi('Resume size', times(r.smaller_by) + '<small>smaller</small>',
-        num(r.bootstrap_tokens) + ' tokens vs a ' + compact(r.agent_peak_tokens) + ' peak', 'good',
+        num(r.bootstrap_tokens) + ' tokens vs a ' + compact(r.agent_peak_tokens) + ' peak' + (session ? ' in this session' : ''), 'good',
         'A size comparison, not a saving: nobody would re-read the whole conversation.')
     : kpi('Resume size', num(r.bootstrap_tokens) + '<small>tokens</small>',
         'no agent turn observed yet to compare with');
@@ -550,21 +614,21 @@ async function drawOverview() {
     'Per resume: ' + num(dl.rebuild_tokens) + ' tokens of project .md files, minus the bootstrap.');
   html += kpi('Settled by code', pct(t.share_by_code), 'of ' + num(t.events) + ' events never reached a model',
     t.share_by_code > 0.5 ? 'good' : '', 'Discarded at ingest or closed by the deterministic fold.');
-  html += kpi('Protected', num(pr.user_critical_items), 'user instructions no worker can weaken', '',
+  html += kpi('Protected' + pw, num(pr.user_critical_items), 'user instructions no worker can weaken', '',
     'Enforced by isProtected in code, not by a prompt.');
   html += '</div>';
 
-  html += '<div class="grid" style="margin-top:14px">' + nowCard(d.working);
+  html += '<div class="grid" style="margin-top:14px">' + nowCard(d.working, pw);
 
   // Resume
   let resume = kv([
-    ['Bootstrap', num(m.context.active_tokens) + ' <small>/ ' + num(m.context.budget) + ' tokens</small>', '', 'the always-on slice, against its budget'],
+    ['Bootstrap' + pw, num(m.context.active_tokens) + ' <small>/ ' + num(m.context.budget) + ' tokens</small>', '', 'the always-on slice, against its budget'],
     ['Effective reduction', pct(m.context.effective_reduction), '', 'token ratio × coverage'],
     ['Coverage', pct(m.context.coverage) + (m.events.pending ? ' <small>· ' + num(m.events.pending) + ' pending</small>' : ''),
       m.context.coverage < 0.7 ? 'warn-t' : ''],
     ['Served from memory', plural(dl.resumes, 'resume') + ' · ' + plural(dl.query, 'query', 'queries'), '',
       num(dl.total) + ' deliveries, ' + num(dl.empty) + ' empty, ' + num(dl.tokens_served) + ' tokens served'],
-    ['Docs re-read per resume', num(dl.rebuild_tokens) + ' <small>tokens · ' + esc(dl.rebuild_source) + '</small>'],
+    ['Docs re-read per resume' + pw, num(dl.rebuild_tokens) + ' <small>tokens · ' + esc(dl.rebuild_source) + '</small>'],
   ]);
   if (r.agent_peak_tokens > 0) {
     const f = (x) => Math.max(0.0025, x / r.agent_peak_tokens);
@@ -582,7 +646,7 @@ async function drawOverview() {
     hbar('Settled by code <small class="muted">free</small>', num(t.handled_by_code), t.handled_by_code / top, 'good') +
     hbar('Read by a worker', num(t.derived_by_model), t.derived_by_model / top) +
     hbar('Still waiting', num(t.pending), t.pending / top, t.pending > 0 ? 'warn' : '') +
-    hbar('Memory items', num(q.active_items), q.active_items / top) +
+    hbar('Memory items' + pw, num(q.active_items), q.active_items / top) +
     '<p class="note">' + plural(t.worker_runs, 'worker call') + ' · ' + num(t.worker_tokens) + ' tokens · ' +
     (t.worker_priced ? '$' + t.worker_cost_usd.toFixed(4) : 'unpriced model') + '</p>');
 
@@ -596,17 +660,17 @@ async function drawOverview() {
       c.hard_compactions === 0 ? 'The agent has never had to compact on its own.'
         : 'The agent compacted ' + plural(c.hard_compactions, 'time') + ' anyway' +
           (dl.bootstrap > 0 ? '; memory was there to resume from.' : ', and no session start has been served from memory yet.')) +
-    check('c-hook', c.hook_p95_ms == null ? '' : hookOk ? 'good' : 'warn', 'Hook p95',
+    check('c-hook', c.hook_p95_ms == null ? '' : hookOk ? 'good' : 'warn', 'Hook p95' + pw,
       c.hook_p95_ms == null ? '–' : ms(c.hook_p95_ms) + ' <small class="muted">/ ' + c.hook_budget_ms + 'ms</small>',
       c.hook_p95_ms == null ? 'No hook latency measured yet.'
         : 'Invisible to the agent while hooks answer within ' + c.hook_budget_ms + 'ms at p95.') +
     check('c-served', dl.total > 0 ? 'good' : 'warn', 'Served from memory', num(dl.total),
       plural(dl.resumes, 'resume') + ' and ' + plural(dl.query, 'targeted query', 'targeted queries') +
-      ' served from memory across ' + plural(c.sessions, 'session') + '.') +
+      ' served from memory ' + (session ? 'in this session.' : 'across ' + plural(c.sessions, 'session') + '.')) +
     '</ul>');
 
   // Guarantees
-  html += card('Guarantees', '<ul class="checks">' +
+  html += card('Guarantees' + pw, '<ul class="checks">' +
     check('g-attr', 'good', 'Unproven user attributions', num(pr.attributions_refused),
       'Patches where a worker claimed the user said something it could not cite. Each was downgraded to agent.') +
     check('g-inv', 'good', 'Invented ids dropped', num(pr.invented_operations_dropped),
@@ -637,7 +701,7 @@ async function drawOverview() {
   // Latency
   const lat = [['hook', m.latency.hook], ['ingest', m.latency.ingest]].filter((x) => x[1]);
   const budget = m.latency.budget_ms;
-  html += card('Latency', lat.length
+  html += card('Latency' + pw, lat.length
     ? '<div class="scroll"><table><thead><tr><th>op</th><th class="r">p50</th><th class="r">p95</th><th class="r">max</th><th class="r">samples</th></tr></thead><tbody>' +
       lat.map((x) => '<tr><td>' + x[0] + '</td><td class="r">' + ms(x[1].p50) + '</td><td class="r' +
         (x[1].p95 > budget ? ' bad-t' : '') + '">' + ms(x[1].p95) + '</td><td class="r muted">' + ms(x[1].max) +
@@ -647,7 +711,7 @@ async function drawOverview() {
 
   // Precision
   const pr2 = m.precision;
-  html += card('Memory precision',
+  html += card('Memory precision' + pw,
     hbar('Never retrieved', pct(pr2.never_retrieved_ratio), pr2.never_retrieved_ratio, pr2.never_retrieved_ratio > 0.5 ? 'warn' : '') +
     hbar('Short lived', pct(pr2.short_lived_ratio), pr2.short_lived_ratio) +
     hbar('Low confidence', pct(pr2.low_confidence_ratio), pr2.low_confidence_ratio) +
@@ -657,10 +721,10 @@ async function drawOverview() {
 
   // Store
   html += card('Store', kv([
-    ['Memory items', num(m.memory.active) + ' <small>active of ' + num(m.memory.items) + '</small>'],
-    ['State version', 'v' + num(m.memory.state_version) + ' <small>· ' + plural(m.memory.patches, 'patch', 'patches') + '</small>'],
-    ['Relations', num(d.edges) + ' <small>· ' + (d.embeddings.enabled ? num(d.embeddings.count) + ' vectors' : 'embeddings off') + '</small>'],
-    ['Contradictions', d.conflicts ? '<a href="#memory/conflicts">' + num(d.conflicts) + '</a>' : '0', d.conflicts ? 'warn-t' : ''],
+    ['Memory items' + pw, num(m.memory.active) + ' <small>active of ' + num(m.memory.items) + '</small>'],
+    ['State version' + pw, 'v' + num(m.memory.state_version) + ' <small>· ' + plural(m.memory.patches, 'patch', 'patches') + '</small>'],
+    ['Relations' + pw, num(d.edges) + ' <small>· ' + (d.embeddings.enabled ? num(d.embeddings.count) + ' vectors' : 'embeddings off') + '</small>'],
+    ['Contradictions' + pw, d.conflicts ? '<a href="#memory/conflicts">' + num(d.conflicts) + '</a>' : '0', d.conflicts ? 'warn-t' : ''],
     ['Worker runs', num(m.workers.runs) + ' <small>· ' + num(m.workers.invalid) + ' invalid · $' + (m.workers.cost_usd || 0).toFixed(4) + '</small>',
       m.workers.invalid ? 'warn-t' : ''],
     ['Agent turns', num(m.agent.turns) + ' <small>· peak ' + num(m.agent.peak_input_tokens) + '</small>'],
@@ -828,28 +892,30 @@ async function drawContext() {
 
 // ----------------------------------------------------------------- history
 /**
- * A step line, not a sloped one: the ratio only moves when an item is created or first served,
- * and holds exactly between those instants. Interpolating would invent values that never existed.
+ * A step line, not a sloped one: every series here only moves at an instant something was logged
+ * (an item created or first served, a resume) and holds exactly between those instants.
+ * Interpolating would invent values that never existed.
+ *
+ * opts: id, points [{ at, v }], yMax, yTicks, yFmt, tip(i), aria, and optionally left, lastLabel. The pointer is remembered per
+ * chart, because the x axis runs to now and the chart repaints on every refresh.
  */
 let chartPointer = null;
 
-function neverRetrievedChart(points) {
-  if (points.length < 2) {
-    return { html: empty('Not enough history yet. The trend starts once memory has items and an agent has been served some:', ATTACH), wire() {} };
-  }
+function stepChart(opts) {
+  const points = opts.points;
   // Draw at the card's real width so text stays 11px instead of scaling with the viewBox;
   // the view redraws on a timer, which also picks up a resize.
-  const W = Math.max(300, Math.min(1180, panel.clientWidth - 38)), H = 220, L = 40, R = 60, T = 12, B = 26;
-  const ratio = (p) => (p.total ? p.never / p.total : 0);
+  const W = Math.max(300, Math.min(1180, panel.clientWidth - 38)), H = 220, L = opts.left || 40, R = 60, T = 12, B = 26;
   const t0 = Date.parse(points[0].at);
   // Run to now: the last value still holds, and ending at the last change hides how long it has.
   // Rounded to the minute, or the markup would differ on every refresh and always repaint.
   const t1 = Math.max(Date.parse(points[points.length - 1].at), Math.ceil(Date.now() / 60e3) * 60e3);
   const span = Math.max(1, t1 - t0);
+  const yMax = Math.max(opts.yMax, 1e-9);
   const x = (t) => L + ((t - t0) / span) * (W - L - R);
-  const y = (r) => T + (1 - r) * (H - T - B);
+  const y = (v) => T + (1 - v / yMax) * (H - T - B);
   const xs = points.map((p) => x(Date.parse(p.at)));
-  const ys = points.map((p) => y(ratio(p)));
+  const ys = points.map((p) => y(p.v));
 
   let path = 'M' + xs[0].toFixed(1) + ' ' + ys[0].toFixed(1);
   for (let i = 1; i < points.length; i += 1) path += 'H' + xs[i].toFixed(1) + 'V' + ys[i].toFixed(1);
@@ -863,68 +929,147 @@ function neverRetrievedChart(points) {
       : dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
   };
   let grid = '';
-  for (const r of [0, 0.25, 0.5, 0.75, 1]) {
-    grid += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(r) + '" y2="' + y(r) +
+  for (const v of opts.yTicks) {
+    grid += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v) + '" y2="' + y(v) +
       '" stroke="var(--line)" stroke-width="1"/>' +
-      '<text x="' + (L - 8) + '" y="' + (y(r) + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">' +
-      r * 100 + '%</text>';
+      '<text x="' + (L - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">' +
+      esc(opts.yFmt(v)) + '</text>';
   }
   for (const [t, anchor] of [[t0, 'start'], [t0 + span / 2, 'middle'], [t1, 'end']]) {
     grid += '<text x="' + x(t) + '" y="' + (H - 6) + '" text-anchor="' + anchor +
       '" fill="var(--muted)" font-size="11">' + esc(whenAxis(t)) + '</text>';
   }
 
-  const last = points[points.length - 1];
   const lx = x(t1), ly = ys[ys.length - 1];
-  const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="never retrieved share over time, now ' +
-    pct(ratio(last)) + '">' + grid +
+  const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + esc(opts.aria) + '">' + grid +
     '<path d="' + area + '" fill="var(--accent-soft)" stroke="none"/>' +
     '<path d="' + path + '" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>' +
     '<circle cx="' + lx + '" cy="' + ly + '" r="4" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>' +
-    '<text x="' + (lx + 8) + '" y="' + (ly + 4) + '" fill="var(--ink)" font-size="12">' + pct(ratio(last)) + '</text>' +
+    '<text x="' + (lx + 8) + '" y="' + (ly + 4) + '" fill="var(--ink)" font-size="12">' + esc(opts.lastLabel || opts.yFmt(points[points.length - 1].v)) + '</text>' +
     '<line class="xh" y1="' + T + '" y2="' + (H - B) + '" stroke="var(--muted)" stroke-width="1" visibility="hidden"/>' +
     '<circle class="xd" r="4" fill="var(--accent)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>' +
     '<rect class="hit" x="' + L + '" y="0" width="' + (W - L - R) + '" height="' + H + '" fill="transparent"/>' +
     '</svg>';
-
-  const rows = points.slice(-30).reverse().map((p) =>
-    '<tr><td title="' + esc(full(p.at)) + '">' + esc(new Date(p.at).toLocaleString()) + '</td><td class="r">' +
-    pct(ratio(p)) + '</td><td class="r muted">' + num(p.never) + ' / ' + num(p.total) + '</td></tr>').join('');
-  const html = '<div class="chart" id="nr-chart">' + svg + '<div class="tip"></div></div>' +
-    '<details class="more-data" data-k="nr-data"><summary><span class="chev">›</span> Data (last ' + Math.min(30, points.length) + ' changes)</summary>' +
-    '<div class="scroll"><table><thead><tr><th>changed at</th><th class="r">never retrieved</th><th class="r">items</th></tr></thead><tbody>' +
-    rows + '</tbody></table></div></details>';
+  const html = '<div class="chart" id="' + opts.id + '">' + svg + '<div class="tip"></div></div>';
 
   function wire() {
-    const box = document.getElementById('nr-chart');
+    const box = document.getElementById(opts.id);
     if (!box) return;
     const el = box.querySelector('svg'), tip = box.querySelector('.tip');
     const xh = el.querySelector('.xh'), xd = el.querySelector('.xd');
     const hide = () => { tip.style.display = 'none'; xh.setAttribute('visibility', 'hidden'); xd.setAttribute('visibility', 'hidden'); };
     el.addEventListener('pointerleave', () => { chartPointer = null; hide(); });
     el.addEventListener('pointermove', (ev) => {
-      chartPointer = { clientX: ev.clientX, clientY: ev.clientY };
+      chartPointer = { id: opts.id, clientX: ev.clientX, clientY: ev.clientY };
       const rect = el.getBoundingClientRect();
       const vx = ((ev.clientX - rect.left) / rect.width) * W;
       if (vx < L || vx > W - R) { hide(); return; }
       // The value under the pointer is the step that began at or before it.
       let i = 0;
       while (i + 1 < xs.length && xs[i + 1] <= vx) i += 1;
-      const p = points[i];
       xh.setAttribute('x1', xs[i]); xh.setAttribute('x2', xs[i]); xh.setAttribute('visibility', 'visible');
       xd.setAttribute('cx', xs[i]); xd.setAttribute('cy', ys[i]); xd.setAttribute('visibility', 'visible');
       const sx = rect.width / W;
-      tip.innerHTML = '<b>' + pct(ratio(p)) + '</b> never retrieved<br><span class="muted">' +
-        num(p.never) + ' of ' + num(p.total) + ' items · ' + esc(new Date(p.at).toLocaleString()) + '</span>';
+      tip.innerHTML = opts.tip(i);
       tip.style.display = 'block';
       const half = tip.offsetWidth / 2;
       tip.style.left = Math.min(rect.width - half, Math.max(half, xs[i] * sx)) + 'px';
       tip.style.top = (ys[i] * sx - 10) + 'px';
     });
     // The x axis runs to now, so the chart repaints on every refresh; put the tooltip back.
-    if (chartPointer) el.dispatchEvent(new PointerEvent('pointermove', chartPointer));
+    if (chartPointer && chartPointer.id === opts.id) el.dispatchEvent(new PointerEvent('pointermove', chartPointer));
   }
   return { html, wire };
+}
+
+function neverRetrievedChart(points) {
+  if (points.length < 2) {
+    return { html: empty('Not enough history yet. The trend starts once memory has items and an agent has been served some:', ATTACH), wire() {} };
+  }
+  const ratio = (p) => (p.total ? p.never / p.total : 0);
+  const last = points[points.length - 1];
+  const chart = stepChart({
+    id: 'nr-chart',
+    points: points.map((p) => ({ at: p.at, v: ratio(p) })),
+    yMax: 1, yTicks: [0, 0.25, 0.5, 0.75, 1], yFmt: (v) => Math.round(v * 100) + '%',
+    aria: 'never retrieved share over time, now ' + pct(ratio(last)),
+    lastLabel: pct(ratio(last)),
+    tip: (i) => '<b>' + pct(ratio(points[i])) + '</b> never retrieved<br><span class="muted">' +
+      num(points[i].never) + ' of ' + num(points[i].total) + ' items · ' + esc(new Date(points[i].at).toLocaleString()) + '</span>',
+  });
+  const rows = points.slice(-30).reverse().map((p) =>
+    '<tr><td title="' + esc(full(p.at)) + '">' + esc(new Date(p.at).toLocaleString()) + '</td><td class="r">' +
+    pct(ratio(p)) + '</td><td class="r muted">' + num(p.never) + ' / ' + num(p.total) + '</td></tr>').join('');
+  return {
+    html: chart.html +
+      '<details class="more-data" data-k="nr-data"><summary><span class="chev">›</span> Data (last ' + Math.min(30, points.length) + ' changes)</summary>' +
+      '<div class="scroll"><table><thead><tr><th>changed at</th><th class="r">never retrieved</th><th class="r">items</th></tr></thead><tbody>' +
+      rows + '</tbody></table></div></details>',
+    wire: chart.wire,
+  };
+}
+
+/** A round axis top: 1, 2 or 5 times a power of ten, at or above the largest value. */
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function savingsChart(h) {
+  if (!h.resumes.length) {
+    return { html: empty('No resume has been served from memory yet. Install hooks so each new session starts from it:', 'contextd init'), wire() {} };
+  }
+  // Start at zero before the first resume, from the first thing ever logged, so a single resume
+  // still draws as a step rather than a lone point.
+  const pts = h.resumes.map((r) => ({ at: r.at, v: r.cumulative_avoided, r }));
+  if (h.first_at && h.first_at < pts[0].at) pts.unshift({ at: h.first_at, v: 0, r: null });
+  if (pts.length < 2) pts.unshift({ at: pts[0].at, v: 0, r: null });
+  const top = niceMax(pts[pts.length - 1].v);
+  return stepChart({
+    id: 'sv-chart', left: 48,
+    points: pts,
+    yMax: top, yTicks: [0, top / 4, top / 2, (3 * top) / 4, top], yFmt: compact,
+    aria: 'tokens avoided by resuming from memory, cumulative, now ' + num(h.tokens_avoided),
+    tip: (i) => {
+      const p = pts[i];
+      if (!p.r) return '<b>0</b> tokens avoided<br><span class="muted">before the first resume</span>';
+      return '<b>' + num(p.v) + '</b> tokens avoided in total<br><span class="muted">this resume +' + num(p.r.avoided_tokens) +
+        ' · served ' + num(p.r.served_tokens) + ' · ' + esc(new Date(p.at).toLocaleString()) + '</span>';
+    },
+  });
+}
+
+const BUCKETS = [['day', 'Daily'], ['week', 'Weekly']];
+
+function bucketLabel(start, by) {
+  const d = new Date(start + 'T00:00:00Z');
+  const opt = { month: 'short', day: 'numeric', timeZone: 'UTC' };
+  return by === 'week' ? 'week of ' + d.toLocaleDateString([], opt) : d.toLocaleDateString([], { weekday: 'short', ...opt });
+}
+
+function bucketsTable(h, by) {
+  const rows = (by === 'week' ? h.weekly : h.daily).slice().reverse();
+  if (!rows.length) {
+    return empty('Nothing logged yet. Activity appears here once an agent session is observed:', ATTACH);
+  }
+  const shown = rows.slice(0, by === 'week' ? 26 : 60);
+  const top = Math.max(1, ...shown.map((b) => b.events));
+  const cost = (b) => (h.worker_priced ? '$' + b.worker_cost_usd.toFixed(4) : compact(b.worker_tokens) + ' <small class="muted">tok</small>');
+  return '<div class="scroll"><table><thead><tr><th>' + (by === 'week' ? 'week (UTC)' : 'day (UTC)') + '</th>' +
+    '<th class="r">resumes</th><th class="r">tokens avoided</th><th class="r">queries</th><th class="r">events</th><th></th>' +
+    '<th class="r" title="stored events closed without a model">settled by code</th><th class="r">worker ' + (h.worker_priced ? 'cost' : 'tokens') + '</th></tr></thead><tbody>' +
+    shown.map((b) => '<tr><td>' + esc(bucketLabel(b.start, by)) + '</td>' +
+      '<td class="r">' + (b.resumes ? num(b.resumes) : '<span class="muted">0</span>') + '</td>' +
+      '<td class="r' + (b.tokens_avoided ? ' good-t' : ' muted') + '">' + compact(b.tokens_avoided) + '</td>' +
+      '<td class="r">' + (b.queries ? num(b.queries) : '<span class="muted">0</span>') + '</td>' +
+      '<td class="r">' + num(b.events) + '</td>' +
+      '<td><div class="track"><div class="fill" style="width:' + Math.max(1, (b.events / top) * 100).toFixed(1) + '%"></div></div></td>' +
+      '<td class="r">' + (b.events ? pct(b.settled_by_code / b.events) : '<span class="muted">–</span>') + '</td>' +
+      '<td class="r">' + (b.worker_runs ? cost(b) : '<span class="muted">–</span>') + '</td></tr>').join('') +
+    '</tbody></table></div>' +
+    (rows.length > shown.length ? '<p class="note">Showing the latest ' + shown.length + ' of ' + rows.length + '.</p>' : '');
 }
 
 function sessionsTable(sessions) {
@@ -942,15 +1087,29 @@ function sessionsTable(sessions) {
 }
 
 async function drawHistory() {
-  const d = await get('/api/overview');
+  const [d, h] = await Promise.all([get('/api/overview'), get('/api/history')]);
+  const by = route.q.by || 'day';
   const pts = d.never_retrieved_history || [];
   const trend = neverRetrievedChart(pts);
+  const savings = savingsChart(h);
   const last = pts[pts.length - 1];
-  const html = card('Never retrieved over time',
+  const seg = '<div class="seg sub" role="tablist" aria-label="Bucket size">' + BUCKETS.map(([id, label]) =>
+    '<button role="tab" aria-selected="' + (id === by) + '" data-by="' + id + '">' + label + '</button>').join('') + '</div>';
+  const html = card('Savings over time',
+      '<p class="note" style="margin:0 0 10px">Tokens an agent did not have to re-read, summed resume by resume. Each resume is charged the bootstrap it was actually served (logged); the documents it is compared against are priced at their size today, ' +
+      num(h.rebuild_tokens) + ' tokens' + (h.rebuild_source === 'config' ? ' as configured' : ' of .md files') +
+      ', because their size at the time was never recorded.</p>' + savings.html,
+      h.resumes.length ? '<span class="num">' + compact(h.tokens_avoided) + ' tokens · ' + plural(h.resumes.length, 'resume') + '</span>' : '') +
+    '<section class="card"><div class="card-h"><h3>Activity by ' + (by === 'week' ? 'week' : 'day') + '</h3>' + seg + '</div>' +
+      bucketsTable(h, by) +
+      '<p class="note">Rebuilt from the retrieval log, the event store and worker runs. Days are UTC.' +
+      (h.discarded_undated ? ' ' + plural(h.discarded_undated, 'event') + ' discarded at ingest are only counted, never stored, so they carry no date: they are in the Overview totals and in no row here.' : '') +
+      '</p></section>' +
+    card('Never retrieved over time',
       '<p class="note" style="margin:0 0 10px">Share of memory items never served to an agent; lower is better. Rebuilt from the retrieval log, so history starts with the first item.</p>' + trend.html,
       last ? '<span class="num">now ' + pct(last.total ? last.never / last.total : 0) + ' · ' + num(last.never) + ' of ' + num(last.total) + '</span>' : '') +
     card('Sessions', sessionsTable(d.sessions), 'latest ' + d.sessions.length);
-  return { html, after: trend.wire };
+  return { html, after: () => { savings.wire(); trend.wire(); } };
 }
 
 // ---------------------------------------------------------------- activity
@@ -1037,13 +1196,19 @@ function renderChrome() {
     '<button role="tab" aria-selected="' + (v.id === route.view) + '" data-view="' + v.id + '">' + v.label +
     '<kbd>' + (i + 1) + '</kbd></button>').join('');
   const v = viewOf(route.view);
+  const scoped = route.view === 'overview';
   $('subnav').innerHTML = v.subs ? v.subs.map(([id, label]) =>
-    '<button role="tab" aria-selected="' + (id === route.sub) + '" data-sub="' + id + '">' + label + '</button>').join('') : '';
-  $('subnav').hidden = !v.subs;
-  // Tools only exist on views with sections, so a view without sections has no bar at all.
-  $('bar').hidden = !v.subs;
+    '<button role="tab" aria-selected="' + (id === route.sub) + '" data-sub="' + id + '">' + label + '</button>').join('')
+    : scoped ? SCOPES.map(([id, label, title]) =>
+      '<button role="tab" aria-selected="' + (id === route.q.scope) + '" data-scope="' + id + '" title="' + esc(title) + '">' +
+      label + '</button>').join('') : '';
+  $('subnav').setAttribute('aria-label', scoped ? 'Scope' : 'Sections');
+  $('subnav').hidden = !v.subs && !scoped;
+  // Tools only exist on views with sections or a scope, so any other view has no bar at all.
+  $('bar').hidden = !v.subs && !scoped;
   const sub = v.subs ? v.subs.find((s) => s[0] === route.sub) : null;
-  $('caption').textContent = sub ? sub[2] : v.caption;
+  captionHtml = null;
+  $('caption').textContent = sub ? sub[2] : scoped && route.q.scope === 'session' ? 'The latest agent session.' : v.caption;
   renderTools();
 }
 
@@ -1078,14 +1243,25 @@ function renderTools() {
 
 function go(view, sub) {
   const v = viewOf(view) || VIEWS[0];
-  const next = { view: v.id, sub: v.subs ? (sub && v.subs.some((s) => s[0] === sub) ? sub : v.subs[0][0]) : null };
+  const next = { view: v.id, sub: v.subs ? (sub && v.subs.some((s) => s[0] === sub) ? sub : v.subs[0][0]) : null,
+    q: v.id === route.view ? route.q : (viewParams[v.id] || parseHash(v.id).q) };
   if (keyOf(next) === keyOf(route)) return;
+  viewParams[route.view] = route.q;
   // Applied now rather than on hashchange, so a shortcut can focus the new view's input at once.
   route = next;
-  if (location.hash.slice(1) !== keyOf(route)) location.hash = keyOf(route);
+  if (location.hash.slice(1) !== hashOf(route)) location.hash = hashOf(route);
   renderChrome();
   draw();
   window.scrollTo(0, 0);
+}
+
+/* A view's setting changes in place; the hash records it so a refresh keeps it. */
+function setParam(name, value) {
+  if (!route.q || route.q[name] === value) return;
+  route = { ...route, q: { ...route.q, [name]: value } };
+  history.replaceState(null, '', '#' + hashOf(route));
+  renderChrome();
+  draw(true);
 }
 
 $('views').addEventListener('click', (e) => {
@@ -1095,10 +1271,14 @@ $('views').addEventListener('click', (e) => {
 $('subnav').addEventListener('click', (e) => {
   const b = e.target.closest('[data-sub]');
   if (b) go(route.view, b.dataset.sub);
+  const s = e.target.closest('[data-scope]');
+  if (s) setParam('scope', s.dataset.scope);
 });
 panel.addEventListener('click', (e) => {
   const c = e.target.closest('[data-cat]');
   if (c) { memCat = c.dataset.cat; paint(renderItems()); }
+  const by = e.target.closest('[data-by]');
+  if (by) setParam('by', by.dataset.by);
 });
 
 // ------------------------------------------------------------------- paint
@@ -1237,6 +1417,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key >= '1' && e.key <= String(VIEWS.length)) {
     e.preventDefault();
     go(VIEWS[Number(e.key) - 1].id);
+  } else if ((e.key === 's' || e.key === 'S') && route.view === 'overview') {
+    e.preventDefault();
+    setParam('scope', route.q.scope === 'session' ? 'all' : 'session');
   } else if (e.key === 'r' || e.key === 'R') {
     e.preventDefault();
     refreshAll();
@@ -1259,11 +1442,13 @@ get('/api/overview').then((d) => {
 // The back button and a pasted #view link must both work, not just clicking a view.
 window.addEventListener('hashchange', () => {
   const next = parseHash(location.hash);
-  if (location.hash.slice(1) !== keyOf(next)) history.replaceState(null, '', '#' + keyOf(next));
-  if (keyOf(next) === keyOf(route)) return;
+  if (location.hash.slice(1) !== hashOf(next)) history.replaceState(null, '', '#' + hashOf(next));
+  if (hashOf(next) === hashOf(route)) return;
+  const sameView = keyOf(next) === keyOf(route);
   route = next;
   renderChrome();
-  draw();
+  // A changed setting on the same view redraws in place: no "loading…" flash, no scroll jump.
+  draw(sameView);
 });
 
 renderChrome();
