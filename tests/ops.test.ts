@@ -344,6 +344,50 @@ describe('doctor', () => {
       cleanup();
     }
   });
+
+  it('warns while the semantic cut has no absolute floor under it', () => {
+    // Measured with a real nomic-embed-text: an off-topic query still produced ten semantic hits,
+    // because the cut is relative to that query's own similarities. Only min_similarity stops it,
+    // and its value belongs to the model, so nothing but the operator can set it.
+    const { root, cleanup } = makeManager();
+    const embeddings = { enabled: true, provider: 'ollama', model: 'm' };
+    const m = new ContextManager({
+      cwd: root,
+      configOverrides: { embeddings: embeddings as never },
+      embeddingProvider: { name: 'scripted', isLocal: true, embed: async (t: string[]) => t.map(() => [1, 0]) },
+    });
+    try {
+      const env = host(root);
+      const warn = find(diagnose(m, { host: env }), 'semantic floor');
+      expect(warn?.status).toBe('warn');
+      expect(warn?.fix).toContain('min_similarity');
+    } finally {
+      m.close();
+      cleanup();
+    }
+
+    const { root: root2, cleanup: cleanup2 } = makeManager();
+    const m2 = new ContextManager({
+      cwd: root2,
+      configOverrides: { embeddings: { ...embeddings, min_similarity: 0.55 } as never },
+      embeddingProvider: { name: 'scripted', isLocal: true, embed: async (t: string[]) => t.map(() => [1, 0]) },
+    });
+    try {
+      expect(find(diagnose(m2, { host: host(root2) }), 'semantic floor')?.status).toBe('ok');
+    } finally {
+      m2.close();
+      cleanup2();
+    }
+  });
+
+  it('says nothing about a floor while embeddings are off', () => {
+    const { manager, root, cleanup } = makeManager();
+    try {
+      expect(find(diagnose(manager, { host: host(root) }), 'semantic floor')).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe('mirror', () => {

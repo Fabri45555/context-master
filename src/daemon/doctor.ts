@@ -369,7 +369,25 @@ function embeddingChecks(manager: ContextManager): Check[] {
           : `${missing} of ${active} active items not embedded with ${index.model}; semantic search cannot find them`,
       ...(missing === 0 ? {} : { fix: 'run `contextd embed --all`' }),
     },
+    semanticFloor(manager.config.embeddings.min_similarity, index.model),
   ];
+}
+
+/**
+ * The semantic cut is relative to each query's own similarities, so it always keeps the top of
+ * whatever distribution it is given - including a query memory has no answer to. Only the absolute
+ * floor can say "nothing here", and its value belongs to the model, so it cannot have a default.
+ */
+function semanticFloor(floor: number, model: string): Check {
+  if (floor > 0) {
+    return { name: 'semantic floor', status: 'ok', detail: `cosine floor ${floor} for ${model}` };
+  }
+  return {
+    name: 'semantic floor',
+    status: 'warn',
+    detail: `no cosine floor (embeddings.min_similarity is 0), so every query keeps semantic hits, including one ${model} has no answer for`,
+    fix: 'ask something memory cannot answer with `contextd context "<off-topic question>"`; set embeddings.min_similarity just above what that returns (a local nomic-embed-text needed ~0.55 here)',
+  };
 }
 
 /**
