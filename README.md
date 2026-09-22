@@ -415,13 +415,32 @@ Some agents only read an instruction file. `contextd mirror` writes the bootstra
 
 ```bash
 contextd mirror                         # CLAUDE.local.md (gitignored by Claude Code convention)
-contextd mirror --target agents         # AGENTS.md, for Codex and others
+contextd mirror --target agents         # AGENTS.md, for Codex, opencode and others
+contextd mirror --target cursor         # .cursor/rules/contextd.mdc, with alwaysApply: true
+contextd mirror --target gemini         # GEMINI.md
 contextd mirror --check                 # exit 1 if the block is missing or stale; writes nothing
 ```
+
+Each target has its own token budget (CLAUDE.local.md 2000, the others 3000; `--budget` overrides).
+To fit it, whole items are left out and the block says how to query them — text is never cut.
 
 A target tracked by git gets a warning: the generated block would be committed. The copy uses
 absolute dates, since a file is read long after it is written. Set
 `mirror.refresh_on_maintenance: true` to rewrite it during maintenance.
+
+### Cursor, Gemini CLI, opencode
+
+contextd cannot observe these agents — they expose no hooks or transcripts it can read — but they
+can use the memory:
+
+```bash
+contextd mcp install --adapter cursor     # .cursor/mcp.json (project) or --scope user
+contextd mcp install --adapter gemini     # .gemini/settings.json (project) or --scope user
+contextd mcp install --adapter opencode   # ~/.config/opencode/opencode.json, or --scope project
+```
+
+Only the `contextd` entry is written, and an entry by that name that contextd did not write is left
+alone. What these agents do is not recorded; the memory they read comes from your other sessions.
 
 ### Bringing in memory the agent already has
 
@@ -430,7 +449,18 @@ contextd import --from claude-memory --dry-run   # what would come in
 contextd import --from claude-memory [<dir>]     # ~/.claude/projects/<slug>/memory by default
 ```
 
-One-way. Each memory file becomes one item (`user`/`feedback` → conventions,
+Instruction files you already wrote can come in the same way:
+
+```bash
+contextd import --from markdown CLAUDE.md AGENTS.md .cursor/rules/*.mdc --dry-run
+```
+
+Each rule-like bullet or paragraph becomes one item, its category taken from the heading
+("Rules" → constraints, "Layout" → architecture…); a `path — purpose` line or table row becomes an
+important file. Code blocks, command lines, other table rows and contextd's own mirror block are
+skipped, each with its reason in `--dry-run`. A rule you edit replaces what it produced before.
+
+For `--from claude-memory`: one-way. Each memory file becomes one item (`user`/`feedback` → conventions,
 `project`/`reference` → discoveries) with `source: import` and capped confidence — never
 attributed to you. `MEMORY.md` is the index and is skipped. Re-running is a no-op; an edited file
 supersedes what it produced before; a retired import stays retired.
@@ -443,9 +473,30 @@ Besides what workers extract, the fold records two things without a model:
   the right one ("`src/core/fold.js` does not exist; the file is `src/core/fold.ts`.") or a command
   the shell rejected followed by the one that worked. Test and build failures never teach a rule:
   a narrower passing command is not a fix.
+- **Rules that keep up.** A mistake seen again revalidates its rule instead of adding a copy; one
+  wrong path fixed to several different files becomes "search for it first"; a rule not seen for
+  21 days fades out of the bootstrap. At most five learned command rules are in the bootstrap.
 - **Memory pointing at files that are gone.** When every path an item names has been deleted, the
   item goes stale (not deleted) and comes back if the file does. A protected item is only flagged,
   and `contextd doctor` lists it for you to retire.
+
+With a model configured, `contextd learn` goes one step further: it finds, in code, the
+episodes where a command failed and something later worked, and asks a model whether each teaches
+something durable about the project ("the API tests need the database container up"). A session
+with no such episode costs nothing.
+
+```bash
+contextd learn --dry-run      # the episodes it would send; no model call
+contextd learn [--session <id> | --all]
+```
+
+Each lesson cites the events it came from and lands as `source: worker`. Set
+`learn.in_lifecycle: true` to run it during consolidation instead of by hand. Raw events are kept
+30 days, so that is the window it can learn from.
+
+`contextd status` also reports **agent loops** — the same call returning the same answer three
+times with nothing changed in between — and `contextd doctor` warns when the latest session did.
+It is a signal about a session, never stored as memory.
 
 ### Every project at once
 
@@ -453,8 +504,18 @@ Besides what workers extract, the fold records two things without a model:
 contextd status --all      # root, items, pending, recovery, hard compactions, last activity
 ```
 
-Read-only. Projects are listed in `~/.contextd/projects.json` (or `$CONTEXTD_HOME`) when you run
-`init`, `attach` or `mcp install` in them; a project set up before that appears after any of the three.
+Read-only. Projects are listed in `~/.contextd/projects.json` (or `$CONTEXTD_HOME`). A project adds
+itself when an agent session starts in it, and on `init`, `attach` and `mcp install`; `status`,
+`doctor` and `ui` add it too where it has a config or a recorded session. Keeping the list clean
+never touches anyone's memory:
+
+```bash
+contextd projects                   # the list; ✗ marks projects that are gone
+contextd projects add [dir]         # a project that already has memory
+contextd projects remove <dir...>   # drop from the list
+contextd projects prune [--dry-run] # drop every project whose directory or memory is gone
+contextd projects clear --yes       # empty it; projects come back on their next session
+```
 
 ---
 
@@ -472,7 +533,9 @@ Read-only. Projects are listed in `~/.contextd/projects.json` (or `$CONTEXTD_HOM
 | `mcp` | Serve memory over MCP on stdio (`mcp serve`, the default) | |
 | `mcp install` / `uninstall` / `status` | Register the MCP server with each agent, remove it, or show where it is | `--adapter`, `--scope`, `--force` |
 | `uninstall` | Remove the hooks, MCP registrations and mirror blocks contextd added | `--purge`, `--yes` |
-| `mirror` | Write the bootstrap into an instruction file | `--target claude-local\|agents\|<path>`, `--check` |
+| `mirror` | Write the bootstrap into an instruction file | `--target claude-local\|agents\|cursor\|gemini\|<path>`, `--budget`, `--check` |
+| `learn` | Turn failure → success episodes into lessons, with a model | `--session`, `--all`, `--dry-run` |
+| `projects` | The registry behind `status --all`: list, add, remove, prune, clear | `--dry-run`, `--yes` |
 | `status` | Metrics: events, memory, reduction, cost, pressure, precision | `--session`, `--json`, `--all` |
 | `memory` | List persistent memory | `--category`, `--all`, `--json` |
 | `context [query]` | Build the context an agent should receive | `--limit`, `--category`, `--json` |
@@ -489,10 +552,10 @@ Read-only. Projects are listed in `~/.contextd/projects.json` (or `$CONTEXTD_HOM
 | `reconcile` | Have a worker resolve contradictions | `--restructure`, `--no-conflicts`, `--max-runs` |
 | `graph [id]` | Typed relations between memory items | `--json` |
 | `embed` | Build the optional semantic index | `--limit`, `--all` |
-| `bench` | Managed context against the unmanaged baseline; or retrieval quality | `--session`, `--json`, `--retrieval`, `--k`, `--verbose`, `--real-embeddings` |
+| `bench` | Managed context against the unmanaged baseline; or retrieval quality | `--session`, `--json`, `--retrieval`, `--k`, `--verbose`, `--real-embeddings`, `--judge`, `--judge-tier`, `--judge-limit` |
 | `prune` | Apply retention and memory decay | |
 | `export` | Export memory and patch log as JSON | `--out <file>` |
-| `import [file]` | Replay an exported patch log, or import an agent's own memory | `--force`, `--from claude-memory`, `--dry-run` |
+| `import [file]` | Replay an exported patch log, or import an agent's own memory | `--force`, `--from claude-memory\|markdown`, `--dry-run` |
 | `reset` | Delete stored context for this project | `--events-only`, `--yes` |
 | `sessions` | List observed agent sessions | |
 | `ui` | Read-only dashboard on localhost | `--port`, `--host` |
@@ -737,6 +800,13 @@ log). The header carries a health pill backed by `GET /api/health`, the same che
 `contextd doctor`; click it for what is failing and how to fix it. Keys: `1`–`4` switch views, `R`
 refreshes, `/` searches memory. Old `#benefits`, `#graph`, `#events` links still land in the right
 place. Light and dark themes follow the system, with a toggle.
+
+The Overview has a **Latest session / All time** switch (key `S`, kept in the URL). Memory is the
+project's, so items, protection, precision and latency are marked *project-wide* and read the same
+in either scope. **History** shows savings over time — the running total of tokens avoided, one
+step per resume — and a Daily/Weekly table of resumes, queries, events, the share settled by code
+and worker spend. All of it is rebuilt from logs contextd already keeps (`GET /api/history`), so it
+starts with your first session and nothing extra is stored.
 
 The Overview opens with what the tool has bought this project, each figure with the baseline it is
 measured against:

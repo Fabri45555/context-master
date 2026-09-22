@@ -114,6 +114,16 @@ one are in [docs/invariants.md](docs/invariants.md) — read the entry before ch
 49. **A recovery is learned only from its own outcome:** same session and tool, not-found path or command-shape error.
 50. **A missing file makes memory stale, never deleted** (`verify_refs`); protected items are flagged, revived when it returns.
 51. **Only a person lifts protection:** `release_protected` from a `user` commit, typed at a TTY (`forget --protected`).
+52. **A learned rule is refined, never duplicated:** recurrence revalidates, ambiguity collapses to "search first", 21 days unseen fades.
+53. **A loop is a signal, not memory:** same call, same answer, nothing changed between; `status`/`doctor` only.
+54. **A lesson cites its episode:** `collectEpisodes` decides what a model sees; no episode, no call.
+55. **A judge's verdict is a measurement:** `bench --judge` is opt-in, respects `local_only`, stores nothing.
+56. **An instruction file is not a rule list:** markdown import drops code, commands, tables and our own mirror block.
+57. **An agent contextd cannot observe says so:** surface `none`; ingestion refuses it; `doctor` only notes it.
+58. **In a JSON config, ours is proven by shape** (`isContextdLaunch`); never replace an entry we did not write.
+59. **A mirror fits its reader's budget by dropping items,** never by cutting text.
+60. **A stale build is a warning, found by stat alone** (`drift.ts`).
+61. **A project registers itself only on evidence of use;** `contextd projects` cleans the registry, never memory.
 
 ## Conventions
 

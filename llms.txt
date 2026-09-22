@@ -21,8 +21,9 @@ contextd ui                                 # optional: the dashboard on localho
 ```
 
 The MCP server is loaded when an agent session starts: register it, then start a new session.
-For an agent with no hooks and no MCP, `contextd mirror --target agents` writes the memory into
-AGENTS.md. `contextd import --from claude-memory` brings in Claude Code's own memory files.
+Cursor, Gemini CLI and opencode: `contextd mcp install --adapter cursor|gemini|opencode`. For an
+agent with no hooks and no MCP, `contextd mirror --target agents|cursor|gemini` writes the memory
+into its instruction file. `contextd import --from claude-memory` brings in Claude Code's own memory files.
 `contextd uninstall` removes only what contextd added.
 
 ## If you are an agent in a project that uses contextd

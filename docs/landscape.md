@@ -177,8 +177,16 @@ declines to own. The memory side had things we lacked:
 | Adaptive keyword weight | `HybridScorer` raises BM25 for UUIDs, ids | `adaptiveKeywordWeight`, also for paths and item ids (invariant 44) |
 | A retrieval handle in the "omitted" marker | CCR's `hash=` in the marker | the marker names `memory_query category=…` or the dropped ids |
 | Retrieval evaluation | LoCoMo with an LLM judge | a deterministic golden set, recall@5 and MRR, no model |
-| Dashboard layout | health pill, scope switch, label/value cards, empty states that say what to run | the four-view `contextd ui` |
+| Dashboard layout | health pill, scope switch, label/value cards, empty states that say what to run | the four-view `contextd ui`, with a latest-session/all-time switch |
+| Savings over time | a savings ledger sampled per request | rebuilt from `retrieval_log`, nothing sampled; ends exactly at the Benefits figure |
+| Refining learned rules | `_refine_error_recovery`: ambiguity → "search first", evidence decay, cap 15 | revalidation, collapse, 21-day TTL, cap 5 in the bootstrap (invariant 52) |
+| `headroom learn` with a model | `learn/analyzer.py` over session digests | `contextd learn`: code finds the episodes, a session without one costs nothing (invariant 54) |
+| Loop detection | `learn/loops.py`, counts over a session | a signal in `status`/`doctor`, never memory, far stricter (invariant 53) |
+| Importing instruction files | `bridge_parsers.py` | `import --from markdown`, dropping code, commands and our own mirror (invariant 56) |
+| Writers per agent, more agents | Cursor/Codex/Claude writers; opencode, grok registries | per-target budgets; Cursor, Gemini CLI, opencode over MCP, declared unobserved (57, 59) |
+| Version drift | `check_version_drift` | a `build` check by stat alone (invariant 60) |
+| LLM-judged retrieval eval | LoCoMo with a judge | `bench --retrieval --judge`, opt-in, stores nothing (invariant 55) |
 
 Refused: the proxy and output shaping (§3), auto-dedup deletion and budget pruning (unguarded
-retirement), loop counts and "known large files" as memory (invariant 28), and a telemetry
+retirement), loop counts and "known large files" stored as memory (invariant 28), and a telemetry
 beacon that is on unless you opt out.

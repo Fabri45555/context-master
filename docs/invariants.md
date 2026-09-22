@@ -291,6 +291,61 @@ Breaking one of these breaks a PRD guarantee, so change them deliberately or not
     interactive terminal - an agent's shell tool is not one. The field stays in the log as the
     record of consent, so replay rebuilds the same state.
 
+52. **A learned rule is refined, never duplicated.** Invariant 49 wrote a rule per recovery and
+    never revisited it. The same mistake seen again now touches the rule (`last_validated_at`),
+    adds evidence and revives it if stale. One wrong path "fixed" to different files is ambiguity,
+    not a typo: those rules collapse into one saying to search first (files in `fields.candidates`),
+    the old ones retired through a guarded `add.supersedes` (12). Rules fade after 21 days unseen
+    through the ordinary TTL - stale, not deleted (13). At most `MAX_BOOTSTRAP_RECOVERY_RULES` (5)
+    learned command rules reach the bootstrap, ranked by `last_validated_at`, never a stored count
+    (28); the rest are named by the omitted marker.
+
+53. **A loop is a signal, not memory.** headroom counts a repeated call over a whole session; on
+    254 real sessions that flagged 818 "loops" in 197 of them - reruns on purpose, screenshots after
+    clicks, polling. `detectLoops` counts a repetition only when it is the same call with the same
+    answer and nothing written or said in between, which flagged none. The count describes one
+    session, so it lives in `status` and `doctor`, never in memory, and never runs on the hook path.
+
+54. **A lesson cites its episode, and code decides what an episode is.** `contextd learn` sends a
+    model only what `collectEpisodes` found deterministically - a failed command, what was tried,
+    what worked - and a session with none makes no call (1). `restrictLearnPatch` keeps only `add`s
+    in `conventions`/`discoveries`, each citing an event id from the digest, `source: worker`,
+    without measurements or code. Learn reads events and never marks them (5); a per-session
+    watermark advances only on `ok` or an empty answer. On 27 real transcripts a looser pairing
+    kept only probes, sandbox refusals and wrong-cwd retries.
+
+55. **A judge's verdict is a measurement.** `bench --retrieval --judge` is opt-in, refuses a
+    non-local model under `local_only` before any call (21), prints its cost and stores nothing.
+
+56. **An instruction file is not a rule list.** `import --from markdown` keeps a statement only when
+    it stands alone. Code blocks, command lines, table rows (except path/purpose), list preambles
+    and contextd's own mirror block never become memory - importing our own copy would be a loop.
+    A rule removed from the file is reported as gone, not retired: the file is not the only source.
+
+57. **An agent contextd cannot observe says so.** Cursor, Gemini CLI and opencode get memory
+    (MCP, `mirror`) but have no ingestion surface: their only surface is `none`, ingestion refuses
+    them, and `doctor` mentions them only where their config dir exists - as a note, since a config
+    dir on the machine is no evidence anyone uses the agent in this project.
+
+58. **In a JSON config, ours is proven by shape.** Where there is no room for markers (45), an
+    entry under our key counts as ours only if it looks like a contextd launch (`isContextdLaunch`);
+    anything else under that name is reported and never replaced, `--force` or not.
+
+59. **A mirror fits its reader's budget by dropping items, never by cutting text.** Each target
+    declares a budget (CLAUDE.local.md 2000, AGENTS.md / GEMINI.md / Cursor 3000); `bootstrap({budget})`
+    scales the section allowances, whole items drop, and the omitted marker names them.
+
+60. **A stale build is a warning, found by stat alone.** The script behind the installed hooks and
+    MCP entries is compared with the newest `src/**/*.ts` beside it and with the checkout's
+    package.json version. A fix that was built but never reaches the agent looks exactly like a
+    fix that did not work.
+
+61. **A project registers itself only on evidence of use.** `status --all` reads a registry of
+    roots. A SessionStart hook, `init`, `attach` and `mcp install` add the project; `status`,
+    `doctor` and `ui` add it only where a config file or an observed session exists, because
+    opening a manager creates storage and a stray command in the wrong directory must not list it
+    forever. `contextd projects` removes, prunes and clears entries; none of them touch memory.
+
 ## Metrics, in full
 
 K1 is reported as three numbers, not one: `token_reduction` (the cheap ratio), `coverage` and
@@ -317,6 +372,12 @@ still a cost.
 `hard_compactions` is how this project scores itself: it counts the times the agent compacted
 anyway, which is the ladder failing. `recovery_ready` asks K5 before the fact — if the agent
 compacted right now, is there enough derived state to continue from?
+
+**Tokens avoided are charged per resume against the bootstrap actually served at that resume**
+(`retrieval_log.tokens`), not today's bootstrap, so the History running total - rebuilt from the
+log like the never_retrieved trend - ends exactly at the Benefits figure (tested). The documents
+are priced at their size now, because their past size was never recorded; the chart says so. A
+`(mirror)` delivery is neither a resume nor a query.
 
 The hook path has an explicit latency budget (`limits.hook_latency_ms`, default 250ms)
 because it is synchronous for the agent. Measured p50 on a real session is ~9ms.
