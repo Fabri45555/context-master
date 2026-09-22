@@ -133,6 +133,32 @@ describe('episode digest', () => {
   );
 
   it(
+    'clips a long command around what changed, not at its head',
+    withManager(undefined, (m) => {
+      // Real episode: `npx eslint <many long paths> -f unix | head -40` failed because the unix
+      // formatter is no longer in core ESLint, and the same call without it worked. Clipped at the
+      // head, both lines read identically and the model learned nothing - it returned an empty patch.
+      const files = Array.from({ length: 8 }, (_, i) => `src/components/market-intelligence/LongComponentName${i}.tsx`).join(' ');
+      ingestEach(m, [
+        call('c1', `npx eslint ${files} -f unix | head -40`),
+        result('c1', 'The unix formatter is no longer part of core ESLint. Install it manually with `npm install -D eslint-formatter-unix`\nExit code 1', true),
+        call('c2', `npx eslint ${files} | head -40`),
+        result('c2', '0 problems'),
+      ]);
+      const d = buildLearnInput(m.store, m.config, 's1', m.projectRoot)!.digest;
+      expect(d.episodes).toHaveLength(1);
+      const failed = d.text.split('\n').find((l) => l.startsWith('failed'))!;
+      const worked = d.text.split('\n').find((l) => l.startsWith('worked'))!;
+      expect(failed).toContain('npx eslint');
+      expect(worked).toContain('npx eslint');
+      // What the two commands do not share is what the lesson is about.
+      expect(failed).toContain('-f unix');
+      expect(worked).not.toContain('-f unix');
+      expect(d.text.split('\n').every((l) => l.length < 320)).toBe(true);
+    }),
+  );
+
+  it(
     'finds no episode in ordinary development, a flaky rerun, or scratch exploration',
     withManager(undefined, (m) => {
       ingestEach(m, [

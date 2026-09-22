@@ -991,6 +991,15 @@ fixed threshold would be wrong for some model, since unrelated text scores ~0.1 
 under another. If the provider is down or slow, the query answers keyword-only instead of failing
 or waiting.
 
+A relative cut has one cost, and it is worth knowing before you turn embeddings on: it always keeps
+something. Measured on this project's own memory (54 items, 49 embedded) with a local
+`nomic-embed-text`, an on-topic query put the right item on top at 0.69 against a 0.48 mean and kept
+7 items; an off-topic one ("weather forecast in Rome tomorrow") peaked at 0.53 against a 0.47 mean
+and still kept 10. Fusion buries that noise below the keyword hits rather than displacing them, but
+it is paid for in tokens. `min_similarity` is the switch for it, and its right value belongs to the
+model you run: around 0.55–0.6 separated signal from noise for `nomic-embed-text` here, and says
+nothing about any other model.
+
 **Contradictions.** Detection is deterministic and free — trigram similarity plus polarity — and
 deliberately crosses category boundaries, because a user constraint contradicted by an agent
 decision is exactly the case a within-category check misses. A model is spent only on deciding which

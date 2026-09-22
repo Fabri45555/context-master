@@ -544,6 +544,18 @@ describe('error text quality', () => {
     expect(r.inert).toHaveLength(1);
   });
 
+  it('treats a script in a temp directory as scratch too', () => {
+    // Real transcripts: `python3 /private/tmp/.../scratchpad/conta.py` failed with a traceback,
+    // the agent fixed its own script and re-ran it, and the pair reached the learn digest as an
+    // episode to teach a lesson from. The one-liner moved into a file is still a one-liner.
+    expect(isScratchCommand('python3 /private/tmp/claude-501/sess/scratchpad/conta.py')).toBe(true);
+    expect(isScratchCommand('/some/venv/bin/python /tmp/probe.py --json')).toBe(true);
+    expect(isScratchCommand('bash /var/folders/8k/T/check.sh')).toBe(true);
+    // Where the output was parked says nothing about what ran.
+    expect(isScratchCommand('npm test > /tmp/out.txt 2>&1')).toBe(false);
+    expect(isScratchCommand('npx vitest run 2>/tmp/err.log')).toBe(false);
+  });
+
   it('traces a tool error back to the call that caused it', () => {
     // A tool error carries only `tool_use_id`; the command lives on the matching call. Without
     // correlating the two, a failed `node -e` is indistinguishable from a failed build - and a

@@ -269,6 +269,11 @@ export class EmbeddingIndex {
  * returns all of itself for any query - fusion then spends the budget on the unrelated. A fixed
  * threshold cannot fix that, because unrelated text scores ~0.1 under one model and ~0.45 under
  * another; one standard deviation above the mean adapts to whichever model is configured.
+ *
+ * What it cannot do - checked against a real `nomic-embed-text` over this project's memory - is
+ * return nothing: an off-topic query has a distribution too, and its top scores clear their own
+ * mean just as the right answer clears its. Only `min_similarity`, which belongs to the model the
+ * operator runs, keeps that out; the fusion is what stops it from displacing the keyword hits.
  */
 export function standOut<T extends { score: number }>(scored: T[], floor = 0): T[] {
   if (scored.length === 0) return scored;

@@ -176,6 +176,15 @@ describe('semantic cut', () => {
     expect(standOut(high).map((x) => x.id)).toEqual(['b0']);
   });
 
+  it('keeps hits for an off-topic query too, which is what the floor is for', () => {
+    // Measured with a real nomic-embed-text over this project's memory: "weather forecast in Rome
+    // tomorrow" peaked at 0.53 against a 0.47 mean and still produced ten semantic hits. A relative
+    // cut cannot say "nothing here"; only min_similarity, which belongs to the model, can.
+    const offTopic = [0.53, 0.52, 0.51, 0.47, 0.44, 0.39].map((score, n) => ({ id: `w${n}`, score }));
+    expect(standOut(offTopic).length).toBeGreaterThan(0);
+    expect(standOut(offTopic, 0.6)).toEqual([]);
+  });
+
   it('honours an absolute floor, and never keeps a non-positive similarity', () => {
     const scored = [0.3, 0.1, 0].map((score, n) => ({ id: `c${n}`, score }));
     expect(standOut(scored, 0.5)).toEqual([]);

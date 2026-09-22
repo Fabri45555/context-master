@@ -27,6 +27,12 @@ const ERROR_PREVIEW = 240;
 /** Longest command rendered. A digest line the model cannot read at a glance teaches nothing. */
 const MAX_COMMAND = 200;
 
+/** Longest command kept on a step before rendering; the render decides what of it is shown. */
+const MAX_COMMAND_RAW = 600;
+
+/** Head kept when a command is clipped around what changed, so the line still names the binary. */
+const DIVERGENCE_HEAD = 60;
+
 /** Minimum substance for a failure to be worth a lesson; "Exit code 1" alone is a number. */
 const MIN_FAILURE_SUBSTANCE = 24;
 
@@ -96,7 +102,7 @@ function step(a: Attempt): EpisodeStep {
   return {
     eventId: a.resultEventId,
     tool: a.tool,
-    key: clip(a.key.replace(/\s+/g, ' ').trim(), MAX_COMMAND),
+    key: clip(a.key.replace(/\s+/g, ' ').trim(), MAX_COMMAND_RAW),
     ok: a.ok,
     error: a.ok ? null : clipHeadTail(a.output),
   };
@@ -224,8 +230,28 @@ export interface EpisodeDigest {
   tokens: number;
 }
 
-function renderStep(label: string, s: EpisodeStep): string[] {
-  const lines = [`${label.padEnd(7)}[${s.eventId}] ${s.tool}: ${s.key}${s.ok ? '  -> ok' : ''}`];
+/**
+ * A command clipped so that what makes it different from `reference` survives.
+ *
+ * A plain head clip lost the whole lesson on a real episode: a 300-character `npx eslint ... -f
+ * unix` and its fix differed only in the flag at the end, so the digest showed the model two
+ * identical lines and it - rightly - learned nothing. When two commands share a long prefix,
+ * the head is kept (it names the binary) and the window moves to where they part.
+ */
+function clipAgainst(command: string, reference: string | null, max = MAX_COMMAND): string {
+  if (command.length <= max) return command;
+  if (!reference) return clip(command, max);
+  let common = 0;
+  while (common < command.length && common < reference.length && command[common] === reference[common]) common += 1;
+  if (common < DIVERGENCE_HEAD) return clip(command, max);
+  const sep = ' … ';
+  const tail = max - DIVERGENCE_HEAD - sep.length;
+  const from = Math.min(Math.max(0, common - 10), Math.max(0, command.length - tail));
+  return `${command.slice(0, DIVERGENCE_HEAD)}${sep}${clip(command.slice(from), tail)}`;
+}
+
+function renderStep(label: string, s: EpisodeStep, reference: string | null = null): string[] {
+  const lines = [`${label.padEnd(7)}[${s.eventId}] ${s.tool}: ${clipAgainst(s.key, reference)}${s.ok ? '  -> ok' : ''}`];
   if (!s.ok && s.error) lines.push(`         error: ${s.error}`);
   return lines;
 }
@@ -247,10 +273,12 @@ export function renderEpisodeDigest(
   for (const ep of episodes) {
     if (kept.length >= limits.maxEpisodes) break;
     const block: string[] = [`### episode ${kept.length + 1} (session ${ep.sessionId})`];
-    block.push(...renderStep('failed', ep.failure));
-    for (const s of ep.steps) block.push(...renderStep('tried', s));
+    // The failure is shown against its fix and everything after it against the failure: on a long
+    // command the part that changed is the lesson, and a head clip is exactly what hides it.
+    block.push(...renderStep('failed', ep.failure, ep.resolution.key));
+    for (const s of ep.steps) block.push(...renderStep('tried', s, ep.failure.key));
     if (ep.note) block.push(`agent  [${ep.note.eventId}] "${ep.note.text.replace(/"/g, "'")}"`);
-    block.push(...renderStep('worked', ep.resolution));
+    block.push(...renderStep('worked', ep.resolution, ep.failure.key));
     block.push('');
     const cost = estimateTokens(block.join('\n'));
     // The first episode is always kept: a digest with nothing in it would be a wasted call.

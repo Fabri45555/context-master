@@ -534,8 +534,24 @@ const MIN_ERROR_SUBSTANCE = 24;
  */
 const SCRATCH_COMMAND = /(?:^|[;&|]\s*)(?:node|python3?|perl|ruby|deno)\s+(?:-\w+\s+)*-(?:e|c)\b/;
 
+/**
+ * The same throwaway, written to a file first because it was too long for `-e`.
+ *
+ * Found by the learn digest on real transcripts: `python3 /private/tmp/.../scratchpad/conta.py`
+ * failed with a traceback, the agent edited its own script, re-ran it, and the pair came back as
+ * an episode to learn a lesson from. A file under a system temp directory - or under the harness's
+ * scratchpad - belongs to the agent's exploration, never to the project (invariant 11).
+ */
+const SCRATCH_PATH = /(?:^|\s)\S*(?:\/private\/tmp\/|\/tmp\/|\/var\/folders\/|\/scratchpad\/)\S+/;
+
+/**
+ * `npm test > /tmp/out.txt 2>&1` is the project's test suite, not scratch: where its output was
+ * parked says nothing about what ran. Redirection targets are taken out before the path is read.
+ */
+const REDIRECTION = /(?:\d?>>?|&>)\s*\S+/g;
+
 export function isScratchCommand(command: string): boolean {
-  return SCRATCH_COMMAND.test(command);
+  return SCRATCH_COMMAND.test(command) || SCRATCH_PATH.test(command.replace(REDIRECTION, ' '));
 }
 
 /**
