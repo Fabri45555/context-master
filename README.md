@@ -113,7 +113,7 @@ hooks and the MCP registration record internally, so they keep working regardles
 ```bash
 cd your-project
 
-contextd init                    # writes contextd.config.json, installs the Claude Code hooks
+contextd init --mcp              # config, Claude Code hooks, and the MCP server registered
 contextd doctor                  # check it is wired before trusting it
 
 # work normally in your agent; then:
@@ -128,6 +128,22 @@ contextd context "refresh token" # what an agent would be handed for this topic
 - `.claude/settings.json` — six hooks (any existing hooks of yours are preserved, not overwritten)
 
 State lives in `.context/`, which is gitignored by default.
+
+Two more steps make it pay off, then **start a new Claude Code session** in that directory — hooks
+and MCP servers are loaded when a session starts:
+
+1. Add the [Project memory](#making-the-agent-actually-use-it) section to the project's `CLAUDE.md`,
+   so the agent actually asks the memory instead of re-reading files.
+2. Optionally, start with memory instead of an empty store:
+
+   ```bash
+   contextd import --from markdown CLAUDE.md --dry-run   # the rules you already wrote down
+   contextd import --from claude-memory --dry-run        # Claude Code's own auto-memory
+   contextd attach --adapter claude --no-worker \
+     --transcript ~/.claude/projects/<slugged-path>/<session>.jsonl   # a past session, no model call
+   ```
+
+   Drop `--dry-run` once the preview looks right.
 
 **Without a model provider configured, contextd still works** — deterministic filtering, the fold,
 retention, decay and retrieval all run. You get a smaller, honest memory; you do not get semantic
@@ -295,6 +311,7 @@ This project has a `contextd` MCP server holding persistent state across session
 - Before working on an area, call `memory_query` with what you are about to do.
 - When you learn something durable — a decision and its reason, a constraint, a discovery —
   call `memory_remember` rather than leaving it in the conversation.
+- When the task changes or finishes, call `memory_task`; when a goal is met, `memory_close`.
 - `memory_query` is cheaper than re-deriving context from the repository. Prefer it.
 ```
 
@@ -313,6 +330,22 @@ contextd mcp uninstall           # this project's registrations, nothing else
 
 There is no daemon to keep running. The hooks do the ingestion; everything else is a command you
 run when you want it.
+
+### Inside Claude Code
+
+Once wired, there is nothing to do: the hooks record the session and the agent starts from the
+bootstrap. Beyond that:
+
+- **Talk to it.** "Remember that we never deploy on Fridays" becomes `memory_remember`; "what do
+  you know about the billing module?" becomes `memory_query`; "that is wrong, retire it" becomes
+  `memory_retire`. The agent cannot retire your own critical instructions — only you can, at a
+  terminal, with `contextd forget <id> --protected`.
+- **Run commands from the prompt** with Claude Code's `!` prefix: `! contextd doctor`,
+  `! contextd memory`, `! contextd status --all`.
+- **Keep the dashboard open** in another terminal: `contextd ui`, then http://127.0.0.1:7717.
+- **If you change contextd itself**, run `npm run build` in its checkout: hooks pick up the new
+  build on their next event, the MCP server on the next session. `contextd doctor` flags a build
+  older than its source.
 
 ```bash
 contextd status            # the dashboard
