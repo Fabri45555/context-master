@@ -8,6 +8,7 @@ import {
 } from '../core/events.js';
 import {
   applyPatch,
+  isClosed,
   isProtected,
   MAX_INFERRED_CONFIDENCE,
   normalizePatch,
@@ -284,6 +285,46 @@ export class ContextStore {
     const args = sessionId ? [sessionId, ...allowed, limit] : [...allowed, limit];
     const rows = this.db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
     return rows.map((r) => this.rowToEvent(r));
+  }
+
+  /**
+   * The latest tool traffic of a session, oldest first, excluding `excludeIds`.
+   *
+   * What the fold looks back over to pair a success with the failure before it: on the hook path
+   * each ingest batch is one event, so the failure is always in an earlier batch. Bounded, and
+   * served by the `(session_id, ts)` index, because this runs on the hook path.
+   */
+  recentToolEvents(sessionId: string, excludeIds: string[], limit = 40): StoredEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM events
+         WHERE session_id = ?
+           AND type IN ('TOOL_CALL', 'FILE_CHANGED', 'TOOL_RESULT', 'ERROR_DETECTED', 'COMMAND_EXECUTED')
+           AND id NOT IN (SELECT value FROM json_each(?))
+         ORDER BY ts DESC, rowid DESC LIMIT ?`,
+      )
+      .all(sessionId, JSON.stringify(excludeIds), limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToEvent(r)).reverse();
+  }
+
+  /**
+   * The active known issue the fold recorded from this event, when a patch may still retire it.
+   *
+   * A protected item is never returned: an `add.supersedes` naming one would be refused by
+   * `validatePatch` (invariant 12) and take the whole fold patch down with it.
+   */
+  issueRecordedFrom(eventId: string): string | null {
+    const rows = this.db
+      .prepare(
+        `SELECT m.* FROM memory_items m, json_each(m.evidence) ev
+         WHERE m.category = 'known_issues' AND m.status = 'active' AND ev.value = ?`,
+      )
+      .all(eventId) as Array<Record<string, unknown>>;
+    for (const r of rows) {
+      const item = rowToItem(r);
+      if (!isProtected(item) && !isClosed(item)) return item.id;
+    }
+    return null;
   }
 
   /** PRD 10 - L2 is for audit and replay, not for eternity. */

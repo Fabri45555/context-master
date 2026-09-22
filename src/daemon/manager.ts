@@ -29,8 +29,12 @@ import type { MemoryItem, WorkingMemory } from '../core/state.js';
 import { WorkerRunner, type RunOutcome, type RunnerOptions } from '../workers/runner.js';
 import type { Provider } from '../workers/providers/types.js';
 import { IngestPipeline, type IngestStats } from './ingest.js';
+import { applyStaleReferences } from './stale.js';
 import { StateMachine, type Transition } from './machine.js';
 import { tailJsonl } from './tail.js';
+
+/** How often the hook path may re-stat memory's file references. */
+const REFS_VERIFY_INTERVAL_MS = 10 * 60_000;
 
 /** Enough for several assistant records; a turn's usage sits in its last one. */
 const USAGE_TAIL_BYTES = 256 * 1024;
@@ -509,6 +513,14 @@ export class ContextManager {
           performed.push({ action, detail: `${n} items expired` });
           break;
         }
+        case 'verify_refs': {
+          const r = this.verifyReferences();
+          performed.push({
+            action,
+            detail: r ? `${r.stale.length} items reference missing files, ${r.revived.length} revived` : 'checked recently',
+          });
+          break;
+        }
         case 'prune': {
           const p = this.prune();
           performed.push({ action, detail: `${p.events} raw events dropped, ${p.items} items decayed` });
@@ -537,6 +549,20 @@ export class ContextManager {
     const mirrored = this.config.mirror.refresh_on_maintenance ? safeRefresh(this) : [];
 
     return { assessment, performed, skipped, mirrored };
+  }
+
+  /**
+   * Mark memory whose referenced files are gone as stale, and revive it if they come back.
+   *
+   * Throttled: the maintain rung runs on the hook path, and files do not vanish between two tool
+   * calls often enough to stat every reference on each of them. `force` is for the CLI.
+   */
+  verifyReferences(opts: { force?: boolean; now?: number } = {}): ReturnType<typeof applyStaleReferences> | null {
+    const now = opts.now ?? Date.now();
+    const last = Date.parse(getMeta(this.store.db, 'refs_verified_at') ?? '');
+    if (!opts.force && Number.isFinite(last) && now - last < REFS_VERIFY_INTERVAL_MS) return null;
+    setMeta(this.store.db, 'refs_verified_at', new Date(now).toISOString());
+    return applyStaleReferences(this.store, this.loaded.root);
   }
 
   /** PRD 43 - mark expired items stale so they stop being injected. */

@@ -11,7 +11,8 @@ import type { Config } from './config.js';
  * So pressure is measured from observed occupancy and answered in stages, cheapest first:
  *
  *   steady      ingest and fold; nothing else is warranted
- *   maintain    deterministic only - drain what can be folded, decay, apply retention
+ *   maintain    deterministic only - drain what can be folded, decay, retire memory whose files
+ *               are gone, apply retention
  *   consolidate spend a model: extract from the backlog, resolve contradictions
  *   reduce      whole-memory reconciliation; the agent is about to compact regardless
  *
@@ -31,6 +32,8 @@ export function stageRank(s: LifecycleStage): number {
 export const LIFECYCLE_ACTIONS = [
   'fold',
   'decay',
+  /** Stat the files memory refers to; a stat is free, so this is a free rung. */
+  'verify_refs',
   'prune',
   'extract',
   'resolve_conflicts',
@@ -40,9 +43,9 @@ export type LifecycleAction = (typeof LIFECYCLE_ACTIONS)[number];
 
 const STAGE_ACTIONS: Record<LifecycleStage, readonly LifecycleAction[]> = {
   steady: [],
-  maintain: ['fold', 'decay'],
-  consolidate: ['fold', 'decay', 'prune', 'extract', 'resolve_conflicts'],
-  reduce: ['fold', 'decay', 'prune', 'extract', 'resolve_conflicts', 'reconcile'],
+  maintain: ['fold', 'decay', 'verify_refs'],
+  consolidate: ['fold', 'decay', 'verify_refs', 'prune', 'extract', 'resolve_conflicts'],
+  reduce: ['fold', 'decay', 'verify_refs', 'prune', 'extract', 'resolve_conflicts', 'reconcile'],
 };
 
 export function actionsFor(stage: LifecycleStage): readonly LifecycleAction[] {
