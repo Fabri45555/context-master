@@ -7,7 +7,8 @@ import { RetrievalEngine } from '../store/retrieval.js';
 import type { ContextStore, StoredEvent } from '../store/store.js';
 import { getProvider, ProviderError, type Provider } from './providers/index.js';
 import { providerIsLocal } from './providers/types.js';
-import { buildRepairPrompt } from './prompts.js';
+import { buildLearnPrompt, buildRepairPrompt } from './prompts.js';
+import { advanceWatermark, buildLearnInput, restrictLearnPatch } from './learn.js';
 import { detectConflicts } from '../core/conflicts.js';
 import {
   buildConflictsPrompt,
@@ -35,6 +36,18 @@ export interface RunnerOptions {
   maxConflictPairs?: number;
   /** Injectable for tests. */
   provider?: Provider;
+  /** Project root, so the `learn` digest names paths relative to it. */
+  projectRoot?: string;
+}
+
+interface Batch {
+  prompt: string;
+  /** Events this run consumes: marked processed on success, inert on an empty answer. */
+  events: StoredEvent[];
+  /** How many events the prompt was built from, for the worker-run record. */
+  eventCount: number;
+  /** `episodes` tasks: the only ids a lesson may cite, and where the session watermark moves. */
+  learn?: { evidenceIds: Set<string>; sessionId: string; until: string };
 }
 
 export interface RunOutcome {
@@ -73,7 +86,15 @@ export class WorkerRunner {
     // conflict resolution, the whole memory for reconciliation (PRD 44).
     const batch = this.selectBatch(definition, sessionId);
     if (!batch) {
-      return this.outcome('skipped', definition.input === 'events' ? 'no_pending_events' : 'nothing_to_do');
+      const why =
+        definition.input === 'events'
+          ? 'no_pending_events'
+          : definition.input === 'episodes'
+            ? sessionId == null
+              ? 'learn_needs_a_session'
+              : 'no_new_episodes'
+            : 'nothing_to_do';
+      return this.outcome('skipped', why);
     }
     const forModel = batch.events;
 
@@ -112,7 +133,7 @@ export class WorkerRunner {
       tier,
       provider: provider.name,
       model: spec.model,
-      eventCount: forModel.length,
+      eventCount: batch.eventCount,
     });
 
     const usage: TokenUsage = { input_tokens: 0, output_tokens: 0 };
@@ -153,7 +174,7 @@ export class WorkerRunner {
 
         // Salvaged entries are recorded in the patch itself, so the log says what was ignored
         // rather than leaving a silent gap between what the model wrote and what was stored.
-        const patch = parsed.dropped?.length
+        let patch = parsed.dropped?.length
           ? {
               ...parsed.patch,
               note: [parsed.patch.note, `dropped malformed: ${parsed.dropped.join(', ')}`]
@@ -161,6 +182,17 @@ export class WorkerRunner {
                 .join(' | '),
             }
           : parsed.patch;
+        if (batch.learn) {
+          // A task-scoped worker is cut down to its task in code before anything is committed.
+          const restricted = restrictLearnPatch(patch, batch.learn.evidenceIds);
+          if (restricted.violations.length > 0) {
+            violations = restricted.violations;
+            trail.push(`pass ${pass + 1}: ${restricted.violations.map((v) => v.code).join(',')}`);
+            continue;
+          }
+          if (restricted.dropped.length > 0) trail.push(`pass ${pass + 1}: learn dropped ${restricted.dropped.length}`);
+          patch = restricted.patch;
+        }
         // Empty as written, or empty once the store pruned its provable no-ops (every add a
         // verbatim copy of existing memory): either way nothing was derived, and a retry would
         // only ask the same question again.
@@ -185,6 +217,7 @@ export class WorkerRunner {
           // these as coverage would let a misconfigured model report a rising K1 while the
           // memory stays empty. They remain in L2, so `inspect` can still reach them.
           this.store.markInert(forModel.map((e) => e.id));
+          if (batch.learn) advanceWatermark(this.store, batch.learn.sessionId, batch.learn.until);
           return this.outcome('noop', 'worker_returned_empty_patch', {
             version,
             eventsProcessed: forModel.length,
@@ -208,9 +241,10 @@ export class WorkerRunner {
             ...(trail.length > 0 ? { error: trail.join(' | ').slice(0, 800) } : {}),
           });
           this.store.markProcessed(forModel.map((e) => e.id));
+          if (batch.learn) advanceWatermark(this.store, batch.learn.sessionId, batch.learn.until);
           return this.outcome('ok', 'patch_applied', {
             version: commit.version,
-            eventsProcessed: forModel.length,
+            eventsProcessed: batch.learn ? batch.eventCount : forModel.length,
             usage,
             costUsd: cost,
             workerRunId: runId,
@@ -275,10 +309,20 @@ export class WorkerRunner {
    * Choose what this task reads, and render its prompt. Returning null means there is
    * nothing for a model to do, which must never cost a call.
    */
-  private selectBatch(
-    definition: TaskDefinition,
-    sessionId: string | null,
-  ): { prompt: string; events: StoredEvent[] } | null {
+  private selectBatch(definition: TaskDefinition, sessionId: string | null): Batch | null {
+    if (definition.input === 'episodes') {
+      // Per session by construction: an episode never spans two sessions.
+      if (sessionId == null) return null;
+      const input = buildLearnInput(this.store, this.config, sessionId, this.opts.projectRoot ?? null);
+      if (!input) return null;
+      return {
+        prompt: buildLearnPrompt(input.existing, input.digest.text),
+        events: [],
+        eventCount: input.digest.evidenceIds.size,
+        learn: { evidenceIds: input.digest.evidenceIds, sessionId, until: input.until },
+      };
+    }
+
     const state = this.store.currentState();
 
     if (definition.input === 'events') {
@@ -286,7 +330,7 @@ export class WorkerRunner {
       const pending = this.store.pendingEvents(sessionId, maxEvents);
       if (pending.length === 0) return null;
       const items = this.selectStateSlice(pending, this.opts.maxStateItems ?? 60);
-      return { prompt: buildEventsPrompt(state, items, pending), events: pending };
+      return { prompt: buildEventsPrompt(state, items, pending), events: pending, eventCount: pending.length };
     }
 
     if (definition.input === 'conflicts') {
@@ -294,7 +338,7 @@ export class WorkerRunner {
         maxPairs: this.opts.maxConflictPairs ?? 8,
       });
       if (conflicts.length === 0) return null;
-      return { prompt: buildConflictsPrompt(state, conflicts), events: [] };
+      return { prompt: buildConflictsPrompt(state, conflicts), events: [], eventCount: 0 };
     }
 
     // 'memory': the whole active memory, capped so one run cannot blow the context.
@@ -302,7 +346,7 @@ export class WorkerRunner {
       .filter((i) => i.status === 'active')
       .slice(0, this.opts.maxStateItems ?? 200);
     if (active.length === 0) return null;
-    return { prompt: buildMemoryPrompt(state, active), events: [] };
+    return { prompt: buildMemoryPrompt(state, active), events: [], eventCount: 0 };
   }
 
   private async callProvider(

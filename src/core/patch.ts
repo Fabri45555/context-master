@@ -136,6 +136,8 @@ export interface PatchViolation {
     | 'self_supersede'
     | 'self_link'
     | 'not_closable'
+    /** A task-scoped worker wrote something its task may not (the `learn` task: only lessons). */
+    | 'out_of_scope'
     /** The response was not a patch at all: no JSON, bad JSON, or a shape nothing can fix. */
     | 'unparsable_response';
   message: string;

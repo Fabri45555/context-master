@@ -27,6 +27,7 @@ import { EmbeddingIndex, type BackfillResult, type EmbeddingProvider } from '../
 import type { MemoryEdge } from '../core/graph.js';
 import type { MemoryItem, WorkingMemory } from '../core/state.js';
 import { WorkerRunner, type RunOutcome, type RunnerOptions } from '../workers/runner.js';
+import { buildLearnInput, type LearnInput } from '../workers/learn.js';
 import type { Provider } from '../workers/providers/types.js';
 import { IngestPipeline, type IngestStats } from './ingest.js';
 import { applyStaleReferences } from './stale.js';
@@ -83,6 +84,7 @@ export class ContextManager {
     this.store = new ContextStore(openDb(dbPath(this.loaded.storageDir)));
     this.pipeline = new IngestPipeline(this.store, this.config, this.loaded.root);
     this.runner = new WorkerRunner(this.store, this.config, {
+      projectRoot: this.loaded.root,
       ...(opts.runnerOptions ?? {}),
       ...(opts.provider ? { provider: opts.provider } : {}),
     });
@@ -454,6 +456,39 @@ export class ContextManager {
     return outcomes;
   }
 
+  // ------------------------------------------------------------------ learn
+
+  /**
+   * Lessons from failure -> success episodes (the `learn` worker task).
+   *
+   * Never on the hook path (invariant 17): it is reached from `contextd learn` and, when
+   * `learn.in_lifecycle` is on, from `lifecycle --act`. A session with no new episode is skipped
+   * without a model call; `dryRun` builds the digests and stops there, writing nothing and calling
+   * nothing. One call per session: a session's episodes past the digest cap wait for the next run.
+   */
+  async learn(opts: { sessionId?: string | null; all?: boolean; dryRun?: boolean; maxSessions?: number } = {}): Promise<
+    Array<{ sessionId: string; input: LearnInput | null; outcome: RunOutcome | null }>
+  > {
+    const sessions = opts.sessionId
+      ? [opts.sessionId]
+      : opts.all
+        ? this.store.sessionIdsWithEvents(opts.maxSessions ?? 500)
+        : this.store.sessionIdsWithEvents(1);
+    const results: Array<{ sessionId: string; input: LearnInput | null; outcome: RunOutcome | null }> = [];
+    for (const sessionId of sessions) {
+      const input = buildLearnInput(this.store, this.config, sessionId, this.loaded.root);
+      if (!input || opts.dryRun) {
+        results.push({ sessionId, input, outcome: null });
+        continue;
+      }
+      const outcome = await this.runner.runOnce(sessionId, 'learn');
+      results.push({ sessionId, input, outcome });
+      // Out of budget, or local_only refusing the provider: the rest would be refused the same way.
+      if (outcome.status === 'deferred') break;
+    }
+    return results;
+  }
+
   // -------------------------------------------------------------- lifecycle
 
   /**
@@ -547,7 +582,19 @@ export class ContextManager {
           performed.push({ action, detail: summarizeOutcomes(outcomes) });
           break;
         }
+        case 'learn':
+          // Never authorised by a stage on its own; appended below when the config opts in.
+          break;
       }
+    }
+
+    // Opt-in only (`learn.in_lifecycle`): a model call per session with an episode is not
+    // something to start spending unasked. It rides the consolidate rung - the first one that may
+    // spend a model at all - and never the deterministic hook path.
+    if (this.config.learn.in_lifecycle && sessionId != null && allowed.includes('extract')) {
+      const results = await this.learn({ sessionId });
+      const outcomes = results.flatMap((r) => (r.outcome ? [r.outcome] : []));
+      performed.push({ action: 'learn', detail: outcomes.length ? summarizeOutcomes(outcomes) : 'no new episodes' });
     }
 
     // Off by default: writing into a file the user reads is not something to start doing

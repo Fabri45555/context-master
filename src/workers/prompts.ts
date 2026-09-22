@@ -136,3 +136,71 @@ export function buildRepairPrompt(previous: string, violations: PatchViolation[]
     'An empty object {} is acceptable if nothing can be safely recorded.',
   ].join('\n');
 }
+
+/**
+ * The `learn` task: lessons from one session's failure -> success episodes.
+ *
+ * Its own prompt (invariant 14) because it has its own job and a much narrower output: only
+ * `add`, only two categories, every item citing the digest lines it came from. The runner enforces
+ * all of that in code (`restrictLearnPatch`); the prompt says it so the model does not spend its
+ * one repair retry finding out.
+ */
+export const LEARN_SYSTEM = `You are a lessons-learned worker for a software project's memory.
+
+You are given a digest of episodes from one coding session. Each episode is a shell command that
+failed, what was tried next, and the command that finally worked. Every line carries the id of the
+event it came from, in square brackets.
+
+Your job: for each episode, decide whether it teaches something durable about how THIS project is
+operated or how it behaves - something a future session would otherwise rediscover by failing the
+same way. Examples of a real lesson:
+- "The API tests need the database container running first (docker compose up -d db)."
+- "Migrations must run before the seed script; the seed fails on a missing table otherwise."
+- "Run Python through the project's virtualenv (uv run python); the system python lacks the dependencies."
+
+Most episodes teach nothing, and then you record nothing for them. Not a lesson:
+- a test or build that failed and then passed because the code was fixed - that is development
+- a command run from the wrong directory, a typo, a flaky or rate-limited call
+- anything the digest does not show: if the fix is not visible in the episode, do not guess one
+
+File each lesson as:
+- "conventions" when it is how to operate the project (which command, which order, which flag)
+- "discoveries" when it is a fact about how the system behaves that cost time to learn
+
+Rules for every item:
+- One lesson per item, one or two sentences, stated as the rule to follow next time, with the
+  reason in "reason" when the episode shows it.
+- "evidence" is required: the ids, copied exactly from the square brackets, of the failure and of
+  the step that fixed it. An item without evidence from this digest is discarded.
+- "source" is "worker". Nothing in the digest is the user speaking.
+- "confidence" at most 0.8: this is a reading of what happened, not something anyone stated.
+- "importance" is "medium", or "high" only when ignoring the lesson breaks the build or the tests.
+- No numbers that describe this run: no counts of attempts, durations, percentages or test totals.
+  They are false the next time it runs.
+- No source code, no stack traces, no pasted output. A command line is fine when it is the lesson.
+- Do not repeat a lesson already listed under "existing lessons"; record nothing instead.
+
+Reply with a single JSON object and nothing else, no markdown fence:
+{
+  "add": [{
+    "category": "conventions"|"discoveries",
+    "text": string,
+    "reason": string|null,
+    "importance": "medium"|"high",
+    "confidence": number,
+    "source": "worker",
+    "evidence": string[]
+  }],
+  "note": string
+}
+
+Any other key is ignored. An empty object {} is the right answer when no episode teaches anything.`;
+
+/** The learn prompt: the lessons already held (so they are not re-learned), then the digest. */
+export function buildLearnPrompt(existing: MemoryItem[], digest: string): string {
+  const lines: string[] = ['## existing lessons'];
+  if (existing.length === 0) lines.push('(none)');
+  for (const i of existing) lines.push(`- [${i.category}] ${i.text}`);
+  lines.push('', digest, '', 'Return the lessons as JSON.');
+  return lines.join('\n');
+}

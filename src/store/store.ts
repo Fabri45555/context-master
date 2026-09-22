@@ -308,6 +308,31 @@ export class ContextStore {
   }
 
   /**
+   * A whole session's tool traffic and agent messages, oldest first: what the `learn` task reads
+   * to find failure -> success episodes. The newest `limit` events, so a very long session is cut
+   * at its start rather than its end.
+   */
+  sessionToolEvents(sessionId: string, limit = 4000): StoredEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM events
+         WHERE session_id = ?
+           AND type IN ('TOOL_CALL', 'FILE_CHANGED', 'TOOL_RESULT', 'ERROR_DETECTED', 'COMMAND_EXECUTED', 'ASSISTANT_MESSAGE')
+         ORDER BY ts DESC, ordinal DESC, rowid DESC LIMIT ?`,
+      )
+      .all(sessionId, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToEvent(r)).reverse();
+  }
+
+  /** Every session that has events, newest first - `contextd learn --all` walks these. */
+  sessionIdsWithEvents(limit = 500): string[] {
+    const rows = this.db
+      .prepare(`SELECT session_id, MAX(ts) AS last FROM events GROUP BY session_id ORDER BY last DESC LIMIT ?`)
+      .all(limit) as Array<{ session_id: string }>;
+    return rows.map((r) => r.session_id);
+  }
+
+  /**
    * The active known issue the fold recorded from this event, when a patch may still retire it.
    *
    * A protected item is never returned: an `add.supersedes` naming one would be refused by

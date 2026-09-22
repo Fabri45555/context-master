@@ -3,6 +3,7 @@ import type { Conflict } from '../core/conflicts.js';
 import type { MemoryItem, ProjectState } from '../core/state.js';
 import type { StoredEvent } from '../store/store.js';
 import {
+  LEARN_SYSTEM,
   PATCH_SHAPE,
   renderEventsForWorker,
   renderStateForWorker,
@@ -17,7 +18,12 @@ import {
  * existing memory - because reconciliation is not about new events at all.
  */
 
-export type TaskInput = 'events' | 'conflicts' | 'memory';
+/**
+ * `episodes` reads a session's failure -> success episodes (src/core/episodes.ts), which are built
+ * from events that may already be processed: it neither consumes nor re-marks them (invariant 5),
+ * and advances a per-session watermark instead.
+ */
+export type TaskInput = 'events' | 'conflicts' | 'memory' | 'episodes';
 
 export interface TaskDefinition {
   task: WorkerTask;
@@ -228,6 +234,12 @@ export const TASK_DEFINITIONS: Record<WorkerTask, TaskDefinition> = {
     input: 'memory',
     system: RECONCILIATION_SYSTEM,
     describe: 'restructure the whole memory for coherence',
+  },
+  learn: {
+    task: 'learn',
+    input: 'episodes',
+    system: LEARN_SYSTEM,
+    describe: 'turn a session\'s failure -> success episodes into lessons',
   },
 };
 

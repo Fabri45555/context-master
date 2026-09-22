@@ -38,6 +38,8 @@ export const LIFECYCLE_ACTIONS = [
   'extract',
   'resolve_conflicts',
   'reconcile',
+  /** Lessons from failure -> success episodes. Not in any stage below: `learn.in_lifecycle` opts in. */
+  'learn',
 ] as const;
 export type LifecycleAction = (typeof LIFECYCLE_ACTIONS)[number];
 
@@ -53,7 +55,7 @@ export function actionsFor(stage: LifecycleStage): readonly LifecycleAction[] {
 }
 
 export function needsProvider(action: LifecycleAction): boolean {
-  return action === 'extract' || action === 'resolve_conflicts' || action === 'reconcile';
+  return action === 'extract' || action === 'resolve_conflicts' || action === 'reconcile' || action === 'learn';
 }
 
 /**

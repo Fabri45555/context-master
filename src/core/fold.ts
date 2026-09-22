@@ -343,6 +343,10 @@ const HARNESS_ERROR = [
   /\buser (?:rejected|denied|declined|interrupted)\b/i,
   /\bpermission (?:to use|denied by)\b/i,
   /\brequires? approval\b/i,
+  // A sandboxed session refusing a command outside its worktree - found by the learn digest on real
+  // transcripts, where it was the single most common "failure" followed by a "fix".
+  /\bis isolated in the worktree\b/i,
+  /\bRefusing to run it\b/,
   // A tool the harness would not run. Recorded four times as a project "known issue" on a real
   // session, complete with the guidance text explaining what the agent may do instead.
   /\bpermission for this action was denied\b/i,
