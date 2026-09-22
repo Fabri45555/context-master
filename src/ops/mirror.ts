@@ -1,6 +1,13 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
-import { instructionFiles, type HostEnv, type InstructionFile } from '../adapters/index.js';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
+import {
+  ADAPTERS,
+  findInstructionFile,
+  instructionFiles,
+  type HostEnv,
+  type InstructionFile,
+  type InstructionFormat,
+} from '../adapters/index.js';
 import { extractBlock, removeBlock, upsertBlock, type Markers } from '../core/markers.js';
 import { getMeta, setMeta } from '../store/db.js';
 import { absoluteTime, type BuiltContext } from '../retrieval/context-builder.js';
@@ -18,6 +25,11 @@ import type { ContextManager } from '../daemon/manager.js';
  * Times are absolute in the copy: "recorded 3h ago" is true only when rendered, and a file is
  * read days later. That also makes the rendering a pure function of state, which is what lets
  * `--check` compare it.
+ *
+ * Each agent's file has its own budget and format (`InstructionFile`): the agent pays for the
+ * whole file on every turn, so the bootstrap is built to that budget by the context builder -
+ * sections shrink and drop whole items, the text is never truncated - and a Cursor rule is
+ * created with the frontmatter that makes Cursor load it.
  */
 
 export const MIRROR_MARKERS: Markers = {
@@ -30,15 +42,52 @@ export const MIRROR_LABEL = '(mirror)';
 /** Absolute paths `mirror` has written, so `uninstall` and maintenance find them again. */
 const TARGETS_META = 'mirror_targets';
 
-export function resolveMirrorTarget(
-  target: string,
-  projectRoot: string,
-  files: readonly InstructionFile[] = instructionFiles(),
-): string {
-  const declared = files.find((f) => f.target === target);
+/** Where a mirror goes, and how it is framed and budgeted there. */
+export interface MirrorTarget {
+  path: string;
+  format: InstructionFormat;
+  /** Token budget for the bootstrap; null means the configured bootstrap budget. */
+  budget: number | null;
+  /** The declared instruction file, when the target is one. */
+  declared: InstructionFile | null;
+}
+
+/** A declared target name, an adapter name, or a path, as an absolute path. */
+export function resolveMirrorTarget(target: string, projectRoot: string): string {
+  const declared = findInstructionFile(target);
+  const adapter = ADAPTERS[target];
+  if (!declared && adapter) {
+    // Otherwise `--target opencode` would quietly create a file called "opencode".
+    throw new Error(`${adapter.agent} declares no instruction file of its own; see \`contextd surfaces\` for the targets`);
+  }
   const path = declared ? declared.path : target;
   return isAbsolute(path) ? path : resolve(projectRoot, path);
 }
+
+/**
+ * Everything about a target. A path that is some agent's declared file gets that file's budget
+ * and format, so `--target .cursor/rules/contextd.mdc` and `--target cursor` write the same
+ * thing - and so does a maintenance refresh, which only remembers paths.
+ */
+export function mirrorTarget(target: string, projectRoot: string, opts: { budget?: number } = {}): MirrorTarget {
+  const path = resolveMirrorTarget(target, projectRoot);
+  const declared = instructionFiles().find((f) => resolve(projectRoot, f.path) === path) ?? null;
+  const format: InstructionFormat = declared?.format ?? (extname(path) === '.mdc' ? 'mdc' : 'markdown');
+  return { path, format, budget: opts.budget ?? declared?.budget ?? null, declared };
+}
+
+/**
+ * The frontmatter a Cursor rule file `mirror` creates starts with. Without `alwaysApply: true`
+ * Cursor attaches a rule only when asked for it, which for project memory means never. Written
+ * only into a file `mirror` creates: in an existing rule, the frontmatter is the person's.
+ */
+export const MDC_FRONTMATTER = [
+  '---',
+  'description: Project memory maintained by contextd (`contextd mirror`)',
+  'alwaysApply: true',
+  '---',
+  '',
+].join('\n');
 
 function header(generatedAt: string, version: number): string {
   return [
@@ -68,12 +117,22 @@ export interface MirrorCheck {
   reason: string;
 }
 
+function targetOf(manager: ContextManager, target: string | MirrorTarget): MirrorTarget {
+  return typeof target === 'string' ? mirrorTarget(target, manager.projectRoot) : target;
+}
+
+function buildOptions(t: MirrorTarget): { absoluteTimes: true; budget?: number } {
+  return { absoluteTimes: true, ...(t.budget != null ? { budget: t.budget } : {}) };
+}
+
 /** Measure only: nothing is logged, nothing written. */
-export function checkMirror(manager: ContextManager, path: string): MirrorCheck {
+export function checkMirror(manager: ContextManager, target: string | MirrorTarget): MirrorCheck {
+  const t = targetOf(manager, target);
+  const { path } = t;
   if (!existsSync(path)) return { path, exists: false, hasBlock: false, stale: true, reason: 'file does not exist' };
   const inner = extractBlock(readFileSync(path, 'utf8'), MIRROR_MARKERS);
   if (inner == null) return { path, exists: true, hasBlock: false, stale: true, reason: 'no contextd block in the file' };
-  const expected = body(manager.bootstrapContext({ absoluteTimes: true })).trim();
+  const expected = body(manager.bootstrapContext(buildOptions(t))).trim();
   const stale = bodyOf(inner) !== expected;
   return { path, exists: true, hasBlock: true, stale, reason: stale ? 'memory changed since it was written' : 'up to date' };
 }
@@ -83,27 +142,39 @@ export interface MirrorWrite {
   created: boolean;
   changed: boolean;
   tokens: number;
+  /** The budget the bootstrap was built to, and how many items it left out to fit. */
+  budget: number;
+  omitted: number;
 }
 
 /**
  * Write (or refresh) the block, replacing only what is between the markers. An unchanged body is
  * not rewritten and not served again - nothing new reached the agent.
  */
-export function writeMirror(manager: ContextManager, path: string, now = new Date().toISOString()): MirrorWrite {
+export function writeMirror(
+  manager: ContextManager,
+  target: string | MirrorTarget,
+  now = new Date().toISOString(),
+): MirrorWrite {
+  const t = targetOf(manager, target);
+  const { path } = t;
   const created = !existsSync(path);
   const before = created ? '' : readFileSync(path, 'utf8');
   const current = extractBlock(before, MIRROR_MARKERS);
-  const measured = manager.bootstrapContext({ absoluteTimes: true });
+  const measured = manager.bootstrapContext(buildOptions(t));
+  const omitted = (b: BuiltContext) => b.sections.reduce((n, s) => n + s.dropped, 0);
   if (current != null && bodyOf(current) === body(measured).trim()) {
     rememberTarget(manager, path);
-    return { path, created: false, changed: false, tokens: measured.tokens };
+    return { path, created: false, changed: false, tokens: measured.tokens, budget: measured.budget, omitted: omitted(measured) };
   }
-  const served = manager.serveBootstrap(null, { absoluteTimes: true, label: MIRROR_LABEL });
+  const served = manager.serveBootstrap(null, { ...buildOptions(t), label: MIRROR_LABEL });
   const inner = `${header(now, manager.store.stateVersion())}\n\n${body(served)}`;
-  writeFileSync(path, upsertBlock(before, MIRROR_MARKERS, inner), 'utf8');
+  const base = created && t.format === 'mdc' ? MDC_FRONTMATTER : before;
+  if (created) mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, upsertBlock(base, MIRROR_MARKERS, inner), 'utf8');
   rememberTarget(manager, path);
   if (created) remember(manager, CREATED_META, path);
-  return { path, created, changed: true, tokens: served.tokens };
+  return { path, created, changed: true, tokens: served.tokens, budget: served.budget, omitted: omitted(served) };
 }
 
 /**
@@ -114,7 +185,9 @@ export function removeMirror(path: string, createdByMirror = false): 'removed' |
   if (!existsSync(path)) return 'absent';
   const next = removeBlock(readFileSync(path, 'utf8'), MIRROR_MARKERS);
   if (next == null) return 'absent';
-  if (createdByMirror && next.trim().length === 0) {
+  // A rule file `mirror` created holds its frontmatter too; with the block gone it is empty.
+  const rest = next.trim();
+  if (createdByMirror && (rest.length === 0 || rest === MDC_FRONTMATTER.trim())) {
     rmSync(path);
     return 'deleted';
   }

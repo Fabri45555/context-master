@@ -48,7 +48,19 @@ export type { Conflict } from './core/conflicts.js';
 export { diagnose, formatChecks, worstStatus } from './daemon/doctor.js';
 export type { Check, CheckStatus } from './daemon/doctor.js';
 
-export { getAdapter, ADAPTERS, ADAPTER_NAMES, claudeAdapter, codexAdapter, genericAdapter } from './adapters/index.js';
+export {
+  getAdapter,
+  getIngestAdapter,
+  ADAPTERS,
+  ADAPTER_NAMES,
+  INGEST_ADAPTER_NAMES,
+  claudeAdapter,
+  codexAdapter,
+  cursorAdapter,
+  geminiAdapter,
+  opencodeAdapter,
+  genericAdapter,
+} from './adapters/index.js';
 export type { Adapter, AdapterContext, TranslateResult } from './adapters/types.js';
 export { installHooks, buildHookConfig, claudeProjectDir } from './adapters/claude/hooks.js';
 export type { HostEnv, McpRegistrar, McpEntry, McpChange, HookInstaller, InstructionFile, NativeMemorySource } from './adapters/types.js';

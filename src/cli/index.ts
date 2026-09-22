@@ -7,8 +7,12 @@ import { spawn } from 'node:child_process';
 import {
   ADAPTER_NAMES,
   ADAPTERS,
+  agentDetected,
   getAdapter,
+  getIngestAdapter,
   hookInstaller,
+  INGEST_ADAPTER_NAMES,
+  ingests,
   instructionFiles,
   mcpAdapters,
   nativeMemorySources,
@@ -28,10 +32,11 @@ import {
   checkMirror,
   mirrorCreatedFiles,
   isTrackedByGit,
-  resolveMirrorTarget,
+  mirrorTarget,
   writeMirror,
 } from '../ops/mirror.js';
-import { applyNativeImport, planNativeImport } from '../ops/import-native.js';
+import { applyNativeImport, planNativeImport, type ImportPlan } from '../ops/import-native.js';
+import { MARKDOWN_SOURCE, planMarkdownImport } from '../ops/import-markdown.js';
 import { formatOverview, summarizeProject } from '../ops/overview.js';
 import { createInterface } from 'node:readline/promises';
 import { isProtected, StatePatchSchema } from '../core/patch.js';
@@ -133,7 +138,12 @@ program
 
     const adapter = getAdapter(opts.agent as string);
     const host = realHost(root);
-    if (opts.hooks !== false) {
+    if (!ingests(adapter)) {
+      // Nothing to wire for ingestion; say how memory reaches this agent instead.
+      out(`${adapter.agent} has no ingestion surface contextd supports: nothing it does is recorded`);
+      const file = adapter.instructionFiles?.[0];
+      if (file) out(`to give it the bootstrap as a file: contextd mirror --target ${file.target}`);
+    } else if (opts.hooks !== false) {
       const installer = hookInstaller(adapter);
       if (!installer) {
         out(`${adapter.agent} has no hook surface; use "contextd attach" or "contextd ingest"`);
@@ -194,7 +204,7 @@ function printMcpChange(adapter: string, c: McpChange): void {
 program
   .command('hook')
   .description('handle one agent hook payload on stdin (fast, never calls a model)')
-  .option('--adapter <name>', `adapter (${ADAPTER_NAMES.join('|')})`, 'claude')
+  .option('--adapter <name>', `adapter (${INGEST_ADAPTER_NAMES.join('|')})`, 'claude')
   .action(async (opts, cmd) => {
     // Hooks run on the agent's critical path. Ingest, return, never block on a provider
     // (PRD 31) - and never fail the agent because of us (PRD 35).
@@ -261,7 +271,7 @@ program
 program
   .command('ingest')
   .description('ingest JSONL records from stdin')
-  .option('--adapter <name>', `adapter (${ADAPTER_NAMES.join('|')})`, 'generic')
+  .option('--adapter <name>', `adapter (${INGEST_ADAPTER_NAMES.join('|')})`, 'generic')
   .option('--session <id>', 'session id', 'manual')
   .option('--worker', 'run a worker afterwards if triggers fire', false)
   .action(async (opts, cmd) => {
@@ -291,7 +301,7 @@ program
 program
   .command('attach')
   .description('follow an already-running agent session transcript')
-  .option('--adapter <name>', `adapter (${ADAPTER_NAMES.join('|')})`, 'claude')
+  .option('--adapter <name>', `adapter (${INGEST_ADAPTER_NAMES.join('|')})`, 'claude')
   .option('--transcript <path>', 'transcript file; defaults to the newest for this project')
   .option('--session <id>', 'session id override')
   .option('--watch', 'keep following', false)
@@ -306,7 +316,7 @@ program
         ? { path: resolve(opts.transcript as string), sessionId: sessionIdFromFilename(resolve(opts.transcript as string)) ?? 'unknown' }
         : resolveTranscript(opts.adapter as string, m.projectRoot);
       if (!found) {
-        const surface = preferredSurface(getAdapter(opts.adapter as string));
+        const surface = preferredSurface(getIngestAdapter(opts.adapter as string));
         out(`no transcript found for ${m.projectRoot}; pass --transcript`);
         if (surface?.description) out(`expected: ${surface.description}`);
         return;
@@ -358,7 +368,7 @@ program
   .command('run')
   .description('run a coding agent with continuous context management')
   .argument('<command...>', 'the agent command, e.g. -- claude')
-  .option('--adapter <name>', `adapter (${ADAPTER_NAMES.join('|')})`, 'claude')
+  .option('--adapter <name>', `adapter (${INGEST_ADAPTER_NAMES.join('|')})`, 'claude')
   .option('--interval <seconds>', 'poll interval', '5')
   .action(async (commandArgs: string[], opts, cmd) => {
     const m = manager(cmd);
@@ -1006,17 +1016,31 @@ program
 
 program
   .command('import')
-  .description('replay an exported patch log, or import an agent\'s own memory (--from)')
-  .argument('[file]', 'a file produced by `contextd export`; with --from, the directory to read')
+  .description('replay an exported patch log, or import an agent\'s own memory or instruction files (--from)')
+  .argument(
+    '[files...]',
+    'a file produced by `contextd export`; with --from, the directory to read; with --from markdown, the files',
+  )
   .option('--force', 'apply patches even if their items already exist', false)
   .option(
     '--from <source>',
-    `one-way import of an agent's native memory (${nativeMemorySources().map((s) => s.name).join('|')})`,
+    `one-way import of an agent's native memory (${nativeMemorySources().map((s) => s.name).join('|')}), ` +
+      `or of instruction files (${MARKDOWN_SOURCE}: CLAUDE.md, AGENTS.md, GEMINI.md, .cursor/rules/*.mdc, any .md)`,
   )
   .option('--dry-run', 'with --from: show what would be imported, change nothing', false)
-  .action((file: string | undefined, opts, cmd) => {
+  .action((files: string[], opts, cmd) => {
     const m = manager(cmd);
+    const file = files[0];
     try {
+      if (opts.from === MARKDOWN_SOURCE) {
+        if (files.length === 0) {
+          out(`pass the files to read: contextd import --from ${MARKDOWN_SOURCE} CLAUDE.md AGENTS.md`);
+          process.exitCode = 1;
+          return;
+        }
+        runImport(m, planMarkdownImport(m.store, files, m.projectRoot), opts.dryRun === true, true);
+        return;
+      }
       if (opts.from) {
         const source = nativeMemorySources().find((s) => s.name === opts.from);
         if (!source) {
@@ -1029,26 +1053,7 @@ program
           out(`nothing to import: ${dir} does not exist`);
           return;
         }
-        const plan = planNativeImport(m.store, source, dir);
-        out(`${source.name}: ${dir}`);
-        for (const c of plan.changes) {
-          const verb = c.action === 'add' ? '+ add    ' : c.action === 'replace' ? '~ replace' : '~ refresh';
-          out(`${verb} [${c.entry.category}] ${c.entry.text.slice(0, 100)}${c.previous ? `  (was ${c.previous.id})` : ''}`);
-        }
-        for (const s of plan.skipped) out(`  skip   ${s.file.split('/').pop()} (${s.reason})`);
-        out(`${plan.changes.length} to import, ${plan.unchanged.length} unchanged since the last import`);
-        if (opts.dryRun === true) {
-          out('dry run: nothing was written');
-          return;
-        }
-        const r = applyNativeImport(m, plan);
-        if (!r.ok) {
-          out(`rejected: ${r.violations.join('; ')}`);
-          process.exitCode = 1;
-          return;
-        }
-        if (r.nothingNew) out('nothing new: already in memory');
-        else out(`imported: ${r.added.length} added, ${r.updated.length} updated (state v${r.version}), source "import"`);
+        runImport(m, planNativeImport(m.store, source, dir), opts.dryRun === true, false);
         return;
       }
       if (!file) {
@@ -1077,6 +1082,37 @@ program
       m.close();
     }
   });
+
+/** Show an import plan, then apply it unless it is a dry run. */
+function runImport(m: ContextManager, plan: ImportPlan, dryRun: boolean, quietSkips: boolean): void {
+  out(`${plan.source}: ${plan.dir}`);
+  for (const c of plan.changes) {
+    const verb = c.action === 'add' ? '+ add    ' : c.action === 'replace' ? '~ replace' : '~ refresh';
+    out(`${verb} [${c.entry.category}] ${c.entry.text.slice(0, 100)}${c.previous ? `  (was ${c.previous.id})` : ''}`);
+  }
+  // A markdown file skips most of what it holds; the reasons are the review, shown on a dry run.
+  if (quietSkips && !dryRun) {
+    if (plan.skipped.length > 0) out(`  ${plan.skipped.length} blocks skipped; --dry-run lists them with the reason`);
+  } else {
+    for (const s of plan.skipped) out(`  skip   ${s.file.split('/').pop()} (${s.reason})`);
+  }
+  for (const o of plan.orphaned) {
+    out(`  gone   ${o.id} [${o.category}] ${o.text.slice(0, 80)} - no longer in the source; kept (contextd forget ${o.id})`);
+  }
+  out(`${plan.changes.length} to import, ${plan.unchanged.length} unchanged since the last import`);
+  if (dryRun) {
+    out('dry run: nothing was written');
+    return;
+  }
+  const r = applyNativeImport(m, plan);
+  if (!r.ok) {
+    out(`rejected: ${r.violations.join('; ')}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (r.nothingNew) out('nothing new: already in memory');
+  else out(`imported: ${r.added.length} added, ${r.updated.length} updated (state v${r.version}), source "import"`);
+}
 
 // ------------------------------------------------------------------ prune
 
@@ -1240,7 +1276,7 @@ function projectRootOf(cmd: Command): string {
 mcp
   .command('install')
   .description('register the contextd MCP server with an agent (idempotent)')
-  .option('--adapter <name>', 'only this agent; default every agent that speaks MCP')
+  .option('--adapter <name>', 'only this agent; default every agent that speaks MCP and is in use here')
   .option('--scope <scope>', "where to register; default the adapter's own default")
   .option('--force', 'replace an existing contextd entry that runs a different command', false)
   .action((opts, cmd) => {
@@ -1249,7 +1285,11 @@ mcp
     const host = realHost(m.projectRoot);
     m.close();
     const launch = selfLaunch();
-    for (const adapter of mcpAdapters(opts.adapter as string | undefined)) {
+    // Without --adapter, only agents that look used: registering creates their config directory.
+    const targets = opts.adapter
+      ? mcpAdapters(opts.adapter as string)
+      : mcpAdapters().filter((a) => agentDetected(a, host));
+    for (const adapter of targets) {
       try {
         printMcpChange(
           adapter.name,
@@ -1302,7 +1342,11 @@ mcp
       if (r.entry.managed) out(`    ${[r.entry.command, ...r.entry.args].join(' ')}`);
       out(`    ${flags.join(' · ')}`);
     }
-    for (const name of status.missing) out(`${name}: not registered  (contextd mcp install --adapter ${name})`);
+    for (const name of status.missing) {
+      // An agent never used here is not "missing" a registration unless it was asked about.
+      if (!opts.adapter && !agentDetected(getAdapter(name), host)) continue;
+      out(`${name}: not registered  (contextd mcp install --adapter ${name})`);
+    }
   });
 
 // -------------------------------------------------------------- uninstall
@@ -1370,24 +1414,42 @@ program
   .description('write the bootstrap into an instruction file the agent already reads')
   .option(
     '--target <name|path>',
-    `${instructionFiles().map((f) => `${f.target} (${f.path})`).join(', ')}, or a path; default config mirror.target`,
+    `${instructionFiles().map((f) => `${f.target} (${f.path})`).join(', ')}, an agent's name, or a path; default config mirror.target`,
   )
+  .option('--budget <tokens>', "tokens the memory may take; default the target's own (see `contextd surfaces`)")
   .option('--check', 'exit non-zero if the block is missing or stale; writes nothing', false)
   .action((opts, cmd) => {
     const m = manager(cmd);
     try {
-      const target = (opts.target as string | undefined) ?? m.config.mirror.target;
-      const path = resolveMirrorTarget(target, m.projectRoot);
+      const name = (opts.target as string | undefined) ?? m.config.mirror.target;
+      const budget = opts.budget != null ? Number(opts.budget) : undefined;
+      if (budget != null && !(Number.isInteger(budget) && budget > 0)) {
+        out('--budget takes a positive number of tokens');
+        process.exitCode = 1;
+        return;
+      }
+      let target;
+      try {
+        target = mirrorTarget(name, m.projectRoot, budget != null ? { budget } : {});
+      } catch (err) {
+        out((err as Error).message);
+        process.exitCode = 1;
+        return;
+      }
+      const { path } = target;
       if (opts.check === true) {
-        const c = checkMirror(m, path);
+        const c = checkMirror(m, target);
         out(`${c.stale ? 'stale' : 'fresh'}: ${path} (${c.reason})`);
         if (c.stale) process.exitCode = 1;
         return;
       }
-      const w = writeMirror(m, path);
+      const w = writeMirror(m, target);
+      // Sections have their own allowances inside the budget, so items can be left out of a full
+      // section while the total is well under it.
+      const fit = w.omitted > 0 ? `; ${w.omitted} items over their section's share left out, reachable by query` : '';
       out(
         w.changed
-          ? `${w.created ? 'created' : 'updated'} ${path} (${w.tokens} tokens of memory)`
+          ? `${w.created ? 'created' : 'updated'} ${path} (${w.tokens} tokens of memory, budget ${w.budget}${fit})`
           : `${path} is already up to date`,
       );
       if (isTrackedByGit(realHost(m.projectRoot), path)) {
@@ -1619,9 +1681,10 @@ program
     for (const adapter of Object.values(ADAPTERS)) {
       out(`${adapter.name}  (${adapter.agent})`);
       for (const s of adapter.surfaces) {
-        const flags = [s.kind, s.preferred ? 'preferred' : null, s.installable ? 'auto-installable' : 'manual']
-          .filter(Boolean)
-          .join(', ');
+        const flags =
+          s.kind === 'none'
+            ? 'no ingestion surface'
+            : [s.kind, s.preferred ? 'preferred' : null, s.installable ? 'auto-installable' : 'manual'].filter(Boolean).join(', ');
         out(`  [${flags}]`);
         out(`    ${s.description}`);
       }
@@ -1630,7 +1693,7 @@ program
         out(`    ${adapter.mcp.description}`);
       }
       for (const f of adapter.instructionFiles ?? []) {
-        out(`  [mirror target: ${f.target}]`);
+        out(`  [mirror target: ${f.target}, ${f.format}, ${f.budget} tokens]`);
         out(`    ${f.path} - ${f.description}`);
       }
       if (adapter.nativeMemory) {
@@ -1679,7 +1742,7 @@ function resolveTranscript(
   adapterName: string,
   projectRoot: string,
 ): { path: string; sessionId: string } | null {
-  const found = newestTranscript(getAdapter(adapterName), projectRoot, homedir());
+  const found = newestTranscript(getIngestAdapter(adapterName), projectRoot, homedir());
   if (!found) return null;
   return { path: found.path, sessionId: found.sessionId ?? sessionIdFromFilename(found.path) ?? 'unknown' };
 }

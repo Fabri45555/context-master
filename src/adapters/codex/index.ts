@@ -43,7 +43,10 @@ export class CodexAdapter implements Adapter {
     {
       target: 'agents',
       path: 'AGENTS.md',
-      description: 'Project instructions read by Codex and other agents following the AGENTS.md convention; usually committed',
+      description:
+        'Project instructions read by Codex, opencode and other agents following the AGENTS.md convention; usually committed',
+      format: 'markdown',
+      budget: 3000,
     },
   ];
 
