@@ -144,6 +144,9 @@ export class ClaudeAdapter implements Adapter {
       target: 'claude-local',
       path: 'CLAUDE.local.md',
       description: 'Personal project instructions Claude Code loads every session; gitignored by convention',
+      format: 'markdown',
+      // Claude Code loads only the first ~200 lines of a memory file (headroom's writer uses 2000).
+      budget: 2000,
     },
   ];
 

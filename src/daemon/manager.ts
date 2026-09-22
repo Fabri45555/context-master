@@ -1,5 +1,5 @@
 import { closeSync, fstatSync, mkdirSync, openSync, readSync } from 'node:fs';
-import { getAdapter, type Adapter, type AdapterContext } from '../adapters/index.js';
+import { getAdapter, getIngestAdapter, type Adapter, type AdapterContext } from '../adapters/index.js';
 import { loadConfig, type Config, type LoadedConfig, type WorkerTask } from '../core/config.js';
 import { evaluateTriggers, type TriggerVerdict } from '../core/deterministic.js';
 import {
@@ -110,7 +110,7 @@ export class ContextManager {
     ctx: AdapterContext,
     opts: { runWorker?: boolean; task?: WorkerTask; force?: boolean } = {},
   ): Promise<CycleResult> {
-    const adapter = getAdapter(adapterName);
+    const adapter = getIngestAdapter(adapterName);
     let ingest: IngestStats;
 
     this.machine.to('INGEST', `${records.length} records via ${adapterName}`);
@@ -174,7 +174,7 @@ export class ContextManager {
   ingestOnly(adapterName: string, records: unknown[], ctx: AdapterContext): IngestStats {
     const started = performance.now();
     try {
-      return this.pipeline.ingest(getAdapter(adapterName), records, ctx);
+      return this.pipeline.ingest(getIngestAdapter(adapterName), records, ctx);
     } finally {
       this.recordLatency('ingest', performance.now() - started, `${records.length} records`);
     }

@@ -42,7 +42,14 @@ export type SurfaceKind =
   /** We tail an append-only log the agent writes. Complete, slightly delayed. */
   | 'transcript'
   /** Something else pipes normalized events to us. */
-  | 'stdin';
+  | 'stdin'
+  /**
+   * No ingestion at all: the agent keeps its history somewhere contextd does not read. Declared
+   * rather than left out, so `surfaces`, `init` and `doctor` say so instead of implying a
+   * transcript that will never be found. Memory still reaches such an agent through MCP and the
+   * mirror.
+   */
+  | 'none';
 
 export interface TranscriptCandidate {
   path: string;
@@ -166,6 +173,12 @@ export interface McpRegistrar {
   unregister(env: HostEnv, name: string, scope: string): McpChange;
 }
 
+/**
+ * How the mirror block is framed. `mdc` is Cursor's rule format: a file it creates starts with
+ * a frontmatter of `alwaysApply: true`, without which Cursor loads the rule only on request.
+ */
+export type InstructionFormat = 'markdown' | 'mdc';
+
 /** A file an agent reads as standing instructions, where `contextd mirror` can write memory. */
 export interface InstructionFile {
   /** Name used on the command line, e.g. `contextd mirror --target <target>`. */
@@ -173,18 +186,31 @@ export interface InstructionFile {
   /** Relative to the project root. */
   path: string;
   description: string;
+  format: InstructionFormat;
+  /**
+   * Tokens the mirrored bootstrap may take in this file. The agent pays for the whole file on
+   * every turn, and some load only a prefix (Claude Code reads the first ~200 lines of memory
+   * files), so the budget is the agent's, not the bootstrap's.
+   */
+  budget: number;
 }
 
 /** One memory the agent wrote in its own format, translated but not yet committed. */
 export interface NativeMemoryEntry {
   /** Absolute path of the file it came from. */
   file: string;
-  /** Stable identity across edits (the file name), so a changed file replaces its import. */
+  /**
+   * Stable identity across edits, so a changed entry replaces its import: the file name for one
+   * memory per file, the file and heading for a section of rules (several entries share it, and
+   * are paired with what the section produced before in order).
+   */
   key: string;
   /** Hash of the file content: unchanged content is not imported twice. */
   hash: string;
   /** The agent's own classification, kept for explainability. */
   nativeType: string | null;
+  /** Structured fields the item carries, e.g. `path` and `purpose` for an important file. */
+  fields?: Record<string, unknown>;
   /** The name the agent gave it, if any. */
   title: string | null;
   category: MemoryCategory;
@@ -224,6 +250,18 @@ export interface Adapter {
   readonly instructionFiles?: readonly InstructionFile[];
   /** The agent's own memory store, for `contextd import --from`. */
   readonly nativeMemory?: NativeMemorySource;
+  /**
+   * Whether this agent appears to be used here - its config directory exists, for this project or
+   * for the user. Stat only. `doctor` runs its checks, and `mcp install` without `--adapter`
+   * registers, only for an agent in use, so contextd never creates `~/.gemini` for someone who
+   * has never run Gemini.
+   */
+  detect?(env: HostEnv): boolean;
+}
+
+/** Whether contextd can read events from this agent at all (see the `none` surface). */
+export function ingests(adapter: Adapter): boolean {
+  return adapter.surfaces.some((s) => s.kind !== 'none');
 }
 
 export function noEvents(): TranslateResult {

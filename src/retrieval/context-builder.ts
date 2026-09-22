@@ -57,6 +57,13 @@ export interface BootstrapOptions {
    * moment it is rendered, and a file is read long after.
    */
   absoluteTimes?: boolean;
+  /**
+   * Tokens the whole slice may take, when a reader has less room than the configured bootstrap -
+   * an instruction file the agent loads on every turn. The section allowances shrink in
+   * proportion, so what does not fit is dropped whole and named by the omitted marker, exactly as
+   * over the configured budget; text is never cut to size. Never grows past the configured slice.
+   */
+  budget?: number;
 }
 
 export interface ServeBootstrapOptions extends BootstrapOptions {
@@ -290,12 +297,14 @@ export class ContextBuilder {
     const eligible = (items: MemoryItem[]) =>
       items.filter((i) => alwaysOnEligible(i, cb.min_bootstrap_confidence));
 
+    const scale = sectionScale(cb.sections, sections[0]!.tokens, opts.budget);
     for (const s of BOOTSTRAP_SECTIONS) {
       const items = eligible(s.categories.flatMap((c) => this.retrieval.byCategory(c)));
-      sections.push(pack(s.title, items, cb.sections[s.budget], false, BOOTSTRAP_ITEM_CHARS));
+      sections.push(pack(s.title, items, Math.floor(cb.sections[s.budget] * scale), false, BOOTSTRAP_ITEM_CHARS));
     }
 
-    return this.finish(sections, cb.total_tokens - cb.reserve_for_retrieval);
+    const configured = cb.total_tokens - cb.reserve_for_retrieval;
+    return this.finish(sections, opts.budget != null ? Math.min(opts.budget, configured) : configured);
   }
 
   /**
@@ -378,6 +387,26 @@ export class ContextBuilder {
       budget,
     };
   }
+}
+
+/**
+ * How much of its configured allowance each memory section keeps under an explicit budget: the
+ * task section is working memory, always shown, so it is paid for first and the sections share
+ * what is left in their configured proportions. `pack` does not count the omitted marker a
+ * section gets when something did not fit, nor the separators, hence the reserve per section.
+ */
+const MARKER_RESERVE = 24;
+
+function sectionScale(
+  allowances: Record<(typeof BOOTSTRAP_SECTIONS)[number]['budget'], number>,
+  taskTokens: number,
+  budget: number | undefined,
+): number {
+  if (budget == null) return 1;
+  const configured = BOOTSTRAP_SECTIONS.reduce((sum, s) => sum + allowances[s.budget], 0);
+  if (configured <= 0) return 1;
+  const left = budget - taskTokens - BOOTSTRAP_SECTIONS.length * MARKER_RESERVE;
+  return Math.max(0, Math.min(1, left / configured));
 }
 
 function queryTitle(query: string, categories: MemoryCategory[] | undefined): string {

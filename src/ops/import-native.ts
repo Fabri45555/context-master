@@ -34,6 +34,12 @@ export interface ImportPlan {
   changes: ImportPlanEntry[];
   unchanged: NativeMemoryEntry[];
   skipped: Array<{ file: string; reason: string }>;
+  /**
+   * Active items an earlier import made from an entry that is gone now. Reported, not retired: a
+   * rule deleted from an instruction file may have been deleted because it moved into memory, and
+   * `contextd forget` is one command away.
+   */
+  orphaned: MemoryItem[];
 }
 
 function importedFrom(item: MemoryItem, source: string): boolean {
@@ -41,27 +47,62 @@ function importedFrom(item: MemoryItem, source: string): boolean {
 }
 
 export function planNativeImport(store: ContextStore, source: NativeMemorySource, dir: string): ImportPlan {
-  const { entries, skipped } = source.read(dir);
-  const mine = store.allItems(true).filter((i) => importedFrom(i, source.name));
-  const byHash = new Set(mine.map((i) => i.fields.import_hash));
-  const plan: ImportPlan = { source: source.name, dir, changes: [], unchanged: [], skipped };
-  for (const entry of entries) {
-    if (byHash.has(entry.hash)) {
+  return planImport(store, source.name, dir, source.read(dir));
+}
+
+/**
+ * Decide what an import changes, for any source.
+ *
+ * An entry whose hash any earlier import of this source produced - live or retired - is
+ * unchanged (invariant 47). The rest are paired, in order, with the live items their key produced
+ * before whose content is no longer read: an edited file, or an edited rule in a section,
+ * replaces its predecessor instead of standing next to it. A key shared by a section's rules
+ * makes the pairing positional within the section, which is what an edit in place looks like.
+ */
+export function planImport(
+  store: ContextStore,
+  source: string,
+  dir: string,
+  read: { entries: NativeMemoryEntry[]; skipped: Array<{ file: string; reason: string }> },
+): ImportPlan {
+  const mine = store.allItems(true).filter((i) => importedFrom(i, source));
+  const knownHashes = new Set(mine.map((i) => i.fields.import_hash));
+  const readHashes = new Set<unknown>(read.entries.map((e) => e.hash));
+  const plan: ImportPlan = { source, dir, changes: [], unchanged: [], skipped: [...read.skipped], orphaned: [] };
+
+  // Live items whose content is no longer in what was read, grouped by key, oldest first.
+  const replaceable = new Map<string, MemoryItem[]>();
+  for (const item of mine) {
+    if (item.status !== 'active' || readHashes.has(item.fields.import_hash)) continue;
+    const key = String(item.fields.import_key);
+    replaceable.set(key, [...(replaceable.get(key) ?? []), item]);
+  }
+
+  const seen = new Set<string>();
+  for (const entry of read.entries) {
+    if (seen.has(entry.hash)) {
+      plan.skipped.push({ file: entry.file, reason: `repeats an earlier entry: ${entry.text.slice(0, 60)}` });
+      continue;
+    }
+    seen.add(entry.hash);
+    if (knownHashes.has(entry.hash)) {
       plan.unchanged.push(entry);
       continue;
     }
-    const previous = mine.find((i) => i.status === 'active' && i.fields.import_key === entry.key) ?? null;
+    const previous = replaceable.get(entry.key)?.shift() ?? null;
     if (!previous) plan.changes.push({ entry, action: 'add', previous: null });
-    // Same statement, different file (a detail edited): update the record, do not mint a twin -
-    // a verbatim re-add would be dropped anyway and the new hash never stored.
+    // Same statement, different content (a detail edited): update the record, do not mint a
+    // twin - a verbatim re-add would be dropped anyway and the new hash never stored.
     else if (previous.text === entry.text && previous.category === entry.category) plan.changes.push({ entry, action: 'refresh', previous });
     else plan.changes.push({ entry, action: 'replace', previous });
   }
+  plan.orphaned = [...replaceable.values()].flat();
   return plan;
 }
 
 function fieldsFor(source: string, entry: NativeMemoryEntry): Record<string, unknown> {
   return {
+    ...(entry.fields ?? {}),
     imported_from: source,
     import_key: entry.key,
     import_hash: entry.hash,

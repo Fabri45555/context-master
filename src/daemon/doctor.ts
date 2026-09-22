@@ -1,7 +1,10 @@
 import { accessSync, constants } from 'node:fs';
+import { relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ADAPTERS,
   hookInstaller,
+  ingests,
   newestTranscript,
   preferredSurface,
   realHost,
@@ -17,6 +20,7 @@ import { MCP_SERVER_NAME, servesProject } from '../ops/install.js';
 import { isOurHookCommand, resolveCommand } from '../ops/self.js';
 import type { ContextManager } from './manager.js';
 import { staleReferences } from './stale.js';
+import { buildDrift, packageRootOf, scriptBehind } from './drift.js';
 
 /**
  * Health check for the wiring.
@@ -41,6 +45,8 @@ export interface DiagnoseOptions {
   host?: HostEnv;
   /** Window for "is memory being pulled". */
   pullWindowDays?: number;
+  /** Package root of the contextd running this check; defaults to this file's. */
+  checkoutRoot?: string | null;
 }
 
 export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): Check[] {
@@ -52,6 +58,8 @@ export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): C
   checks.push(...storageChecks(manager));
   checks.push(...adapterChecks(manager, host, wiring));
   checks.push(...mcpChecks(host, wiring));
+  const checkoutRoot = opts.checkoutRoot !== undefined ? opts.checkoutRoot : packageRootOf(fileURLToPath(import.meta.url));
+  checks.push(...buildChecks(host, wiring, checkoutRoot));
   checks.push(...providerChecks(config));
   checks.push(...budgetChecks(config));
   checks.push(...latencyChecks(manager));
@@ -97,8 +105,16 @@ function inspectWiring(manager: ContextManager, host: HostEnv): Wiring {
   return wiring;
 }
 
-function agentInUse(adapter: Adapter, wiring: Wiring): boolean {
-  return (wiring.hooks.get(adapter.name)?.ours.length ?? 0) > 0 || wiring.transcripts.get(adapter.name) != null;
+/**
+ * Hooks or a transcript are proof of use; an agent contextd cannot observe is judged by its
+ * config directory (`detect`), since it leaves nothing else behind.
+ */
+function agentInUse(adapter: Adapter, wiring: Wiring, host: HostEnv): boolean {
+  return (
+    (wiring.hooks.get(adapter.name)?.ours.length ?? 0) > 0 ||
+    wiring.transcripts.get(adapter.name) != null ||
+    (!ingests(adapter) && adapter.detect?.(host) === true)
+  );
 }
 
 function storageChecks(manager: ContextManager): Check[] {
@@ -133,6 +149,16 @@ function adapterChecks(manager: ContextManager, host: HostEnv, wiring: Wiring): 
 
     if (surface.kind === 'hook') {
       out.push(...hookChecks(adapter, host, wiring));
+    }
+
+    // Not a failure and nothing to fix, but worth one line where the agent is used: its sessions
+    // leave no trace in memory, which otherwise looks like a broken ingestion.
+    if (surface.kind === 'none' && agentInUse(adapter, wiring, host)) {
+      out.push({
+        name: `${adapter.name}: ingestion`,
+        status: 'skip',
+        detail: `${adapter.agent} has no ingestion surface; memory reaches it through MCP and \`contextd mirror\`, nothing it does is recorded`,
+      });
     }
 
     // Report the transcript surface too: it is the fallback when hooks are not installed.
@@ -192,6 +218,10 @@ function mcpChecks(host: HostEnv, wiring: Wiring): Check[] {
   for (const adapter of Object.values(ADAPTERS)) {
     const reg = wiring.mcp.get(adapter.name);
     if (!reg) continue;
+    // An agent that has never been run here gets no line at all: three "not used" rows for agents
+    // someone does not have is noise in the one command meant to show what is wrong.
+    const used = agentInUse(adapter, wiring, host);
+    if (!ingests(adapter) && !used && reg.serving.length === 0 && reg.elsewhere.length === 0) continue;
     const name = `${adapter.name}: mcp`;
     const fix = `run \`contextd mcp install --adapter ${adapter.name}\``;
     if (reg.serving.length === 0) {
@@ -205,7 +235,7 @@ function mcpChecks(host: HostEnv, wiring: Wiring): Check[] {
         });
       } else if (reg.elsewhere.some((e) => !e.managed)) {
         out.push({ name, status: 'warn', detail: `a "${MCP_SERVER_NAME}" entry contextd did not write is in the way`, fix: 'inspect it with `contextd mcp status`' });
-      } else if (agentInUse(adapter, wiring)) {
+      } else if (used) {
         out.push({ name, status: 'warn', detail: `not registered; ${adapter.agent} cannot query memory`, fix });
       } else {
         out.push({ name, status: 'skip', detail: `${adapter.agent} not used in this project` });
@@ -225,6 +255,59 @@ function mcpChecks(host: HostEnv, wiring: Wiring): Check[] {
     }
   }
   return out;
+}
+
+/**
+ * The build the hooks and MCP entries run, against the source it came from. A checkout edited
+ * and not rebuilt leaves every agent on the old code, silently: the tests pass on the new code
+ * while the agent keeps running the old.
+ */
+function buildChecks(host: HostEnv, wiring: Wiring, checkoutRoot: string | null): Check[] {
+  const users = new Map<string, Set<string>>();
+  const note = (script: string | null, who: string) => {
+    if (script) users.set(script, (users.get(script) ?? new Set()).add(who));
+  };
+  for (const [name, hooks] of wiring.hooks) {
+    for (const h of hooks.ours) note(scriptBehind(resolveCommand(h.command, host)), `${name} hooks`);
+  }
+  for (const [name, reg] of wiring.mcp) {
+    for (const e of reg.serving) if (e.managed) note(scriptBehind(resolveCommand(e, host)), `${name} mcp`);
+  }
+  const out: Check[] = [];
+  for (const [script, who] of users) {
+    const drift = buildDrift(script, checkoutRoot);
+    // A missing script is the hook or MCP check's failure to report, not a drift.
+    if (!drift) continue;
+    const by = [...who].join(', ');
+    const problems: string[] = [];
+    if (drift.newerSource) {
+      const rel = drift.packageRoot ? relative(drift.packageRoot, drift.newerSource.path) : drift.newerSource.path;
+      problems.push(`${rel} is ${describeSpan(drift.newerSource.aheadMs)} newer than the build`);
+    }
+    if (drift.versionMismatch) {
+      problems.push(`it is v${drift.versionMismatch.installed}, this checkout is v${drift.versionMismatch.checkout}`);
+    }
+    out.push({
+      name: 'build',
+      status: problems.length > 0 ? 'warn' : 'ok',
+      detail:
+        problems.length > 0
+          ? `${script} (run by ${by}) is out of date: ${problems.join('; ')}`
+          : `${script} (run by ${by}) is current${drift.version ? `, v${drift.version}` : ''}`,
+      ...(problems.length > 0
+        ? { fix: `rebuild: npm run build${drift.packageRoot ? ` (in ${drift.packageRoot})` : ''}` }
+        : {}),
+    });
+  }
+  return out;
+}
+
+function describeSpan(ms: number): string {
+  const mins = Math.round(ms / 60_000);
+  if (mins < 1) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  if (mins < 120) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  return hours < 48 ? `${hours}h` : `${Math.round(hours / 24)}d`;
 }
 
 /** Semantic retrieval quietly degrades to keyword-only for every item the index lacks. */
