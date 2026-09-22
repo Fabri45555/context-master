@@ -15,6 +15,7 @@ import { collectMetrics, type Metrics } from '../metrics/index.js';
 import { ContextBuilder, type BuiltContext, type QueryOptions } from '../retrieval/context-builder.js';
 import { dbPath, getMeta, openDb, setMeta } from '../store/db.js';
 import { ContextStore } from '../store/store.js';
+import { findSimilar, type SimilarHit } from '../core/similar.js';
 import { EmbeddingIndex, type BackfillResult, type EmbeddingProvider } from '../store/embeddings.js';
 import type { MemoryEdge } from '../core/graph.js';
 import type { MemoryItem, WorkingMemory } from '../core/state.js';
@@ -322,6 +323,26 @@ export class ContextManager {
   /** User-authored memory, e.g. `contextd remember`. Always source "user". */
   remember(patch: StatePatch): ReturnType<ContextStore['commitPatch']> {
     return this.store.commitPatch(patch, 'user', {});
+  }
+
+  /**
+   * Near-duplicates of an item just written, for the write-time hint (`memory_remember`,
+   * `contextd remember`). Advisory only: it reads, it never writes a patch (invariant 12).
+   *
+   * Async because, with embeddings on, the new item is embedded first so the cosine check can
+   * see it - the same refresh a hybrid query does. That makes this unfit for the hook path
+   * (invariant 17), and nothing there calls it. A provider that is down just leaves the
+   * trigram check, which never needs one.
+   */
+  async similarTo(id: string): Promise<SimilarHit[]> {
+    const item = this.store.getItem(id);
+    if (!item) return [];
+    let cosine: Map<string, number> | undefined;
+    if (this.embeddings.enabled) {
+      const refreshed = await this.embeddings.backfill();
+      if (!(refreshed.error && refreshed.failed > 0)) cosine = this.embeddings.cosineTo(id);
+    }
+    return findSimilar(item, this.store.currentState().items, cosine ? { cosine } : {});
   }
 
   /**

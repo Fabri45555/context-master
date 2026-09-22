@@ -11,6 +11,8 @@ export interface QueryOptions {
   sessionId?: string | null;
   /** false for a preview that never reaches an agent - see `serveQuery`. */
   record?: boolean;
+  /** Restrict the hits to these categories; with an empty query, list them. */
+  categories?: MemoryCategory[];
 }
 
 /**
@@ -37,6 +39,16 @@ export interface ContextSection {
   itemIds: string[];
   /** Items shown only in part (see BOOTSTRAP_ITEM_CHARS); a query may render them again in full. */
   clippedIds?: string[];
+  /**
+   * The categories of the items that did not fit, in order of first appearance. Carried through
+   * for the same reason as `itemIds`: the omitted marker names where to get the rest, and that
+   * must not be recovered from the rendered text.
+   */
+  droppedCategories?: MemoryCategory[];
+  /** Ids of the items that did not fit - named in the marker when there are few enough. */
+  droppedIds?: string[];
+  /** Which marker the section gets when something did not fit. Absent means bootstrap. */
+  kind?: 'bootstrap' | 'query';
 }
 
 export interface BuiltContext {
@@ -149,6 +161,8 @@ function pack(
   const lines: string[] = [];
   const itemIds: string[] = [];
   const clippedIds: string[] = [];
+  const droppedCategories: MemoryCategory[] = [];
+  const droppedIds: string[] = [];
   let tokens = estimateTokens(title) + 2;
   let dropped = 0;
   for (const item of items) {
@@ -156,6 +170,8 @@ function pack(
     const cost = estimateTokens(line);
     if (tokens + cost > allowance) {
       dropped += 1;
+      droppedIds.push(item.id);
+      if (!droppedCategories.includes(item.category)) droppedCategories.push(item.category);
       continue;
     }
     lines.push(line);
@@ -163,12 +179,39 @@ function pack(
     if (needsClip(item, maxChars)) clippedIds.push(item.id);
     tokens += cost;
   }
-  return { title, lines, tokens, dropped, itemIds, clippedIds };
+  return { title, lines, tokens, dropped, itemIds, clippedIds, droppedCategories, droppedIds };
 }
 
-function sectionText(s: ContextSection): string {
+/** At most this many omitted ids are named in a query's marker; past it, the count is enough. */
+export const OMITTED_IDS_SHOWN = 4;
+
+/**
+ * The line that says something did not fit - and how to get it, because "omitted" with no way
+ * back is a dead end the agent can only re-derive around.
+ *
+ * A bootstrap section drops whole categories' tails, so it points at the category listing
+ * (`memory_query` with `category`, which lists a category when the query is empty). A query's
+ * section drops ranked hits, so a handful are named by id for `memory_explain`; more than that,
+ * and a narrower query is the better advice than a longer marker.
+ */
+export function omittedMarker(s: Pick<ContextSection, 'dropped' | 'droppedCategories' | 'droppedIds'>, kind: 'bootstrap' | 'query'): string {
+  if (s.dropped <= 0) return '';
+  if (kind === 'query') {
+    const ids = s.droppedIds ?? [];
+    if (ids.length > 0 && ids.length <= OMITTED_IDS_SHOWN) {
+      return `(+${s.dropped} more omitted for budget: ${ids.join(', ')} - memory_explain <id>)`;
+    }
+    return `(+${s.dropped} more omitted for budget - narrow the query or raise its limit)`;
+  }
+  const cats = s.droppedCategories ?? [];
+  if (cats.length === 0) return `(+${s.dropped} more, omitted for context budget)`;
+  return `(+${s.dropped} more omitted for budget - memory_query category="${cats.join('" / "')}")`;
+}
+
+function sectionText(s: ContextSection, kind: 'bootstrap' | 'query'): string {
   if (s.lines.length === 0) return '';
-  const suffix = s.dropped > 0 ? `\n  (+${s.dropped} more, omitted for context budget)` : '';
+  const marker = omittedMarker(s, kind);
+  const suffix = marker ? `\n  ${marker}` : '';
   return `## ${s.title}\n${s.lines.join('\n')}${suffix}`;
 }
 
@@ -259,7 +302,8 @@ export class ContextBuilder {
    * so a narrow query cannot accidentally hide a user constraint.
    */
   forQuery(query: string, opts: QueryOptions = {}): BuiltContext {
-    return this.serveQuery(query, this.retrieval.search(query, { limit: opts.limit ?? 12 }), opts);
+    const categories = opts.categories && opts.categories.length > 0 ? { categories: opts.categories } : {};
+    return this.serveQuery(query, this.retrieval.search(query, { limit: opts.limit ?? 12, ...categories }), opts);
   }
 
   /**
@@ -272,10 +316,12 @@ export class ContextBuilder {
    */
   async forQueryHybrid(query: string, index: EmbeddingIndex, opts: QueryOptions = {}): Promise<BuiltContext> {
     const limit = opts.limit ?? 12;
-    if (!index.enabled) return this.forQuery(query, opts);
+    // An empty query is a category listing: there is nothing to embed.
+    if (!index.enabled || query.trim().length === 0) return this.forQuery(query, opts);
     const refreshed = await index.backfill();
     if (refreshed.error && refreshed.failed > 0) return this.forQuery(query, opts);
-    return this.serveQuery(query, await this.retrieval.searchHybrid(query, index, { limit }), opts);
+    const categories = opts.categories && opts.categories.length > 0 ? { categories: opts.categories } : {};
+    return this.serveQuery(query, await this.retrieval.searchHybrid(query, index, { limit, ...categories }), opts);
   }
 
   private serveQuery(query: string, found: ScoredItem[], opts: QueryOptions): BuiltContext {
@@ -287,12 +333,10 @@ export class ContextBuilder {
     const alwaysIds = new Set(base.itemIds.filter((id) => !clipped.has(id)));
     const hits = found.filter((h) => !alwaysIds.has(h.item.id));
 
-    const relevant = pack(
-      `Relevant memory for: ${query.slice(0, 120)}`,
-      hits.map((h) => h.item),
-      cb.reserve_for_retrieval,
-      true,
-    );
+    const relevant: ContextSection = {
+      ...pack(queryTitle(query, opts.categories), hits.map((h) => h.item), cb.reserve_for_retrieval, true),
+      kind: 'query',
+    };
 
     const sections = [...base.sections, relevant];
     const built = this.finish(sections, cb.total_tokens);
@@ -308,7 +352,7 @@ export class ContextBuilder {
 
   private finish(sections: ContextSection[], budget: number): BuiltContext {
     const kept = sections.filter((s) => s.lines.length > 0);
-    const text = kept.map(sectionText).filter(Boolean).join('\n\n');
+    const text = kept.map((s) => sectionText(s, s.kind ?? 'bootstrap')).filter(Boolean).join('\n\n');
     return {
       text,
       tokens: estimateTokens(text),
@@ -317,6 +361,13 @@ export class ContextBuilder {
       budget,
     };
   }
+}
+
+function queryTitle(query: string, categories: MemoryCategory[] | undefined): string {
+  const q = query.trim().slice(0, 120);
+  const cats = categories && categories.length > 0 ? categories.join(', ') : null;
+  if (!cats) return `Relevant memory for: ${q}`;
+  return q.length > 0 ? `Relevant memory for: ${q} (in ${cats})` : `Memory in ${cats}`;
 }
 
 function describeAge(iso: string, now = Date.now()): string {

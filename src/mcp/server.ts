@@ -1,9 +1,10 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { MEMORY_CATEGORIES } from '../core/state.js';
 import { EDGE_KINDS } from '../core/graph.js';
 import { formatMetrics } from '../metrics/index.js';
+import { formatSimilarHint } from '../core/similar.js';
 import { RetrievalEngine } from '../store/retrieval.js';
 import type { ContextManager } from '../daemon/manager.js';
 
@@ -59,18 +60,24 @@ export function buildMcpServer(manager: ContextManager): McpServer {
     'memory_query',
     {
       description:
-        'Retrieve project memory relevant to a topic, plus the always-on critical items. Use before starting work on an area, instead of re-deriving context.',
+        'Retrieve project memory relevant to a topic, plus the always-on critical items. Use before starting work on an area, instead of re-deriving context. Pass category to search one category; with category and no query it lists that category, e.g. the items a bootstrap section omitted for budget.',
       inputSchema: {
-        query: z.string().describe('What you are about to work on, in natural language.'),
+        query: z.string().optional().describe('What you are about to work on, in natural language.'),
+        category: CategoryEnum.optional().describe('Restrict to one memory category.'),
         limit: z.number().int().min(1).max(50).optional(),
       },
     },
-    async ({ query, limit }) => {
-      const built = await manager.queryContextHybrid(query, {
+    async ({ query, category, limit }) => {
+      const q = (query ?? '').trim();
+      if (q.length === 0 && !category) {
+        return { isError: true, content: [{ type: 'text' as const, text: 'Pass a query, a category, or both.' }] };
+      }
+      const built = await manager.queryContextHybrid(q, {
         limit: limit ?? 12,
         sessionId: manager.store.activeSessionId(),
+        ...(category ? { categories: [category] } : {}),
       });
-      const text = built.text.length > 0 ? built.text : `No memory matched: ${query}`;
+      const text = built.text.length > 0 ? built.text : `No memory matched: ${q || category}`;
       return { content: [{ type: 'text' as const, text: `${text}\n\n(${built.tokens} tokens)` }] };
     },
   );
@@ -119,10 +126,12 @@ export function buildMcpServer(manager: ContextManager): McpServer {
           ],
         };
       }
+      const recorded = `Recorded ${result.added.join(', ')} (state v${result.version}).`;
+      // Advisory text only: the writer decides whether it duplicated or replaced something.
+      const newId = result.added[0];
+      const hint = newId ? await similarHint(manager, newId, 'mcp') : '';
       return {
-        content: [
-          { type: 'text' as const, text: `Recorded ${result.added.join(', ')} (state v${result.version}).` },
-        ],
+        content: [{ type: 'text' as const, text: hint ? `${recorded}\n${hint}` : recorded }],
       };
     },
   );
@@ -337,12 +346,19 @@ export function buildMcpServer(manager: ContextManager): McpServer {
   );
 
   // A resource so an agent can browse a whole category without burning a tool call per item.
+  // A template, not a string: registered as a plain string the URI was one literal resource,
+  // `contextd://memory/{category}`, and no real category URI resolved.
   server.registerResource(
     'memory-category',
-    'contextd://memory/{category}',
+    new ResourceTemplate('contextd://memory/{category}', {
+      list: async () => ({
+        resources: MEMORY_CATEGORIES.map((c) => ({ uri: `contextd://memory/${c}`, name: `memory: ${c}` })),
+      }),
+    }),
     { description: 'All active memory items in one category.' },
-    async (uri) => {
-      const category = uri.pathname.replace(/^\/+/, '') || uri.hostname;
+    async (uri, variables) => {
+      const raw = variables.category;
+      const category = Array.isArray(raw) ? raw[0] : raw;
       const parsed = CategoryEnum.safeParse(category);
       if (!parsed.success) {
         return {
@@ -368,6 +384,16 @@ export function buildMcpServer(manager: ContextManager): McpServer {
   );
 
   return server;
+}
+
+/** The write already committed; a hint that fails to compute must not turn it into an error. */
+export async function similarHint(manager: ContextManager, id: string, surface: 'mcp' | 'cli'): Promise<string> {
+  try {
+    const written = manager.store.getItem(id);
+    return written ? formatSimilarHint(written, await manager.similarTo(id), surface) : '';
+  } catch {
+    return '';
+  }
 }
 
 export async function runMcpStdio(manager: ContextManager): Promise<void> {

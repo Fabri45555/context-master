@@ -25,6 +25,11 @@ export interface SearchOptions {
   /** Minimum importance to return. */
   minImportance?: MemoryItem['importance'];
   now?: number;
+  /**
+   * Raise the keyword side of hybrid fusion when the query names something exact (a path, an
+   * identifier, an id). On by default; the retrieval eval turns it off to measure what it buys.
+   */
+  adaptiveKeywordWeight?: boolean;
 }
 
 export interface ScoredItem {
@@ -64,6 +69,55 @@ const STOPWORDS = new Set([
   'non', 'una', 'uno', 'gli', 'gia', 'come', 'sono', 'gli', 'gl', 'gl',
 ]);
 
+/**
+ * Tokens that name one thing exactly, by kind. An embedding places `src/store/db.ts` near every
+ * sentence about databases, and `d12` near nothing at all; the keyword index matches them
+ * literally. So when a query carries one, the keyword ranking is the more trustworthy of the two.
+ */
+export type ExactKind = 'uuid' | 'path' | 'memory_id' | 'identifier' | 'version' | 'number' | 'flag';
+
+const EXACT_PATTERNS: ReadonlyArray<readonly [ExactKind, RegExp]> = [
+  ['uuid', /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i],
+  // A slash between word characters, or a name with a short extension: `src/cli`, `db.ts`.
+  // Two characters before the dot keeps "e.g" and "i.e" out.
+  ['path', /[\w.-]+\/[\w.-]+|\b[\w-]{2,}\.[a-z][a-z0-9]{0,5}\b/i],
+  // `mem_...` and the short ids workers assign (`d3`, `kw12`).
+  ['memory_id', /\bmem_[a-z0-9_]+\b|\b[a-z]{1,3}\d{1,4}\b/],
+  // camelCase, PascalCase with an inner capital, snake_case, SCREAMING_CASE.
+  ['identifier', /\b[a-z]+[A-Z][A-Za-z0-9]*\b|\b[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*\b|\b[A-Za-z0-9]+_[A-Za-z0-9_]+\b/],
+  ['version', /\bv?\d+\.\d+(?:\.\d+)*\b/],
+  // Three digits or more: a port, an error code, a line number. "3 retries" is prose.
+  ['number', /\b\d{3,}\b/],
+  ['flag', /(?:^|\s)--?[a-z][\w-]*/i],
+];
+
+/** Which exact-match kinds a query contains. Pure, so it is tested on its own. */
+export function exactMatchKinds(query: string): ExactKind[] {
+  return EXACT_PATTERNS.filter(([, re]) => re.test(query)).map(([kind]) => kind);
+}
+
+/** Kinds that name one item or one file: a semantic neighbour is almost never what was meant. */
+const STRONG_KINDS: ReadonlySet<ExactKind> = new Set(['uuid', 'path', 'memory_id']);
+
+/** Keyword weight for a query with a strong exact token, and with any other one. */
+export const KEYWORD_WEIGHT_STRONG = 0.8;
+export const KEYWORD_WEIGHT_EXACT = 0.7;
+/** Never all the way to 1: the semantic list still breaks ties and finds what the words miss. */
+export const KEYWORD_WEIGHT_MAX = 0.9;
+
+/**
+ * The keyword side's weight in reciprocal rank fusion, raised - never lowered - for queries that
+ * name something exactly. Borrowed from headroom's adaptive alpha. A configured keyword weight of
+ * 0 is a deliberate "semantic only" and is left alone.
+ */
+export function adaptiveKeywordWeight(query: string, base: number): number {
+  if (base <= 0) return base;
+  const kinds = exactMatchKinds(query);
+  if (kinds.length === 0) return base;
+  const target = kinds.some((k) => STRONG_KINDS.has(k)) ? KEYWORD_WEIGHT_STRONG : KEYWORD_WEIGHT_EXACT;
+  return Math.max(base, Math.min(KEYWORD_WEIGHT_MAX, target));
+}
+
 export class RetrievalEngine {
   constructor(private store: ContextStore) {}
 
@@ -73,23 +127,29 @@ export class RetrievalEngine {
     const now = opts.now ?? Date.now();
     const match = toMatchQuery(query);
 
+    // The category filter goes into the SQL, not only after it: `memory_query` with a category
+    // and no query text lists that category, and a post-filter over the top rows of every
+    // category would return a partial list whenever other categories fill the window.
+    const cats = opts.categories && opts.categories.length > 0 ? opts.categories : null;
+    const catSql = cats ? ` AND m.category IN (${cats.map(() => '?').join(', ')})` : '';
     const rows = match
       ? (this.store.db
           .prepare(
             `SELECT m.*, bm25(memory_fts) AS bm25
              FROM memory_fts JOIN memory_items m ON m.rowid = memory_fts.rowid
-             WHERE memory_fts MATCH ?
+             WHERE memory_fts MATCH ?${catSql}
              ORDER BY bm25 LIMIT ?`,
           )
-          .all(match, limit * 6) as Array<Record<string, unknown>>)
+          .all(match, ...(cats ?? []), limit * 6) as Array<Record<string, unknown>>)
       : (this.store.db
           .prepare(
             `SELECT m.*, 0 AS bm25 FROM memory_items m
+             WHERE 1 = 1${catSql}
              ORDER BY CASE m.importance WHEN 'critical' THEN 0 WHEN 'high' THEN 1
                       WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, m.updated_at DESC
              LIMIT ?`,
           )
-          .all(limit * 6) as Array<Record<string, unknown>>);
+          .all(...(cats ?? []), limit * 6) as Array<Record<string, unknown>>);
 
     const scored: ScoredItem[] = [];
     for (const r of rows) {
@@ -175,10 +235,12 @@ export class RetrievalEngine {
       return this.expand(keyword.slice(0, limit), limit, opts.now ?? Date.now());
     }
 
-    const weight = index.weight;
+    const semanticWeight = index.weight;
+    const keywordWeight =
+      opts.adaptiveKeywordWeight === false ? 1 - semanticWeight : adaptiveKeywordWeight(query, 1 - semanticWeight);
     const fused = reciprocalRankFusion([
-      { ids: keyword.map((h) => h.item.id), weight: 1 - weight },
-      { ids: semantic.map((h) => h.id), weight },
+      { ids: keyword.map((h) => h.item.id), weight: keywordWeight },
+      { ids: semantic.map((h) => h.id), weight: 1 - keywordWeight },
     ]);
 
     const byId = new Map(keyword.map((h) => [h.item.id, h]));

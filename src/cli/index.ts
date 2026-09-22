@@ -19,9 +19,11 @@ import { CONFIG_FILENAMES, findConfigFile, type WorkerTask } from '../core/confi
 import { ContextManager } from '../daemon/manager.js';
 import { formatMetrics, formatPressure } from '../metrics/index.js';
 import { benchmark, formatBench } from '../bench/index.js';
-import { runMcpStdio } from '../mcp/server.js';
+import { evaluateRetrieval, formatRetrievalEval } from '../bench/retrieval-eval.js';
+import { runMcpStdio, similarHint } from '../mcp/server.js';
 import { startUi } from '../ui/server.js';
 import { RetrievalEngine } from '../store/retrieval.js';
+import { getEmbeddingProvider } from '../store/embeddings.js';
 import { diagnose, formatChecks, worstStatus } from '../daemon/doctor.js';
 
 const program = new Command();
@@ -410,13 +412,23 @@ program
   .description('build the context an agent should receive')
   .argument('[query...]', 'what you are about to work on')
   .option('--limit <n>', 'max retrieved items', '12')
+  .option('--category <name>', `restrict to one category; alone, list it (${MEMORY_CATEGORIES.join(', ')})`)
   .option('--json', 'machine-readable output', false)
   .action(async (queryParts: string[], opts, cmd) => {
     const m = manager(cmd);
     try {
       const query = queryParts.join(' ').trim();
+      const category = opts.category as string | undefined;
+      if (category && !(MEMORY_CATEGORIES as readonly string[]).includes(category)) {
+        out(`unknown category: ${category} (one of: ${MEMORY_CATEGORIES.join(', ')})`);
+        process.exitCode = 1;
+        return;
+      }
+      const categories = category ? { categories: [category as MemoryCategory] } : {};
       const built =
-        query.length > 0 ? await m.queryContextHybrid(query, { limit: Number(opts.limit) }) : m.bootstrapContext();
+        query.length > 0 || category
+          ? await m.queryContextHybrid(query, { limit: Number(opts.limit), ...categories })
+          : m.bootstrapContext();
       if (opts.json) {
         out(JSON.stringify(built, null, 2));
         return;
@@ -667,7 +679,7 @@ program
   .option('--importance <level>', 'critical|high|medium|low', 'critical')
   .option('--source <who>', 'user|agent - "agent" for a correction you did not hear from the user', 'user')
   .option('--supersedes <ids>', 'comma-separated ids this statement replaces (they are retired, not deleted)')
-  .action((textParts: string[], opts, cmd) => {
+  .action(async (textParts: string[], opts, cmd) => {
     const m = manager(cmd);
     try {
       const text = textParts.join(' ').trim();
@@ -697,6 +709,9 @@ program
         return;
       }
       out(`remembered ${result.added.join(', ')} (state v${result.version})`);
+      const newId = result.added[0];
+      const hint = newId ? await similarHint(m, newId, 'cli') : '';
+      if (hint) out(hint);
     } finally {
       m.close();
     }
@@ -917,10 +932,29 @@ program
   .command('bench')
   .description('compare managed context against the unmanaged baseline')
   .option('--session <id>', 'limit to one session')
+  .option('--retrieval', 'instead: retrieval quality (recall@k, MRR) on the golden fixture', false)
+  .option('--real-embeddings', 'with --retrieval: use the configured embedding provider, not the offline stand-in', false)
+  .option('--k <n>', 'with --retrieval: cutoff for recall@k', '5')
+  .option('--verbose', 'with --retrieval: per-query ranks', false)
   .option('--json', 'machine-readable output', false)
-  .action((opts, cmd) => {
+  .action(async (opts, cmd) => {
     const m = manager(cmd);
     try {
+      if (opts.retrieval === true) {
+        // The fixture runs in its own in-memory store; this project's memory is only read for its
+        // embedding config, and nothing measured is written back (invariant 28).
+        const real = opts.realEmbeddings === true;
+        if (real && !m.embeddings.enabled) {
+          out('--real-embeddings: embeddings are disabled in this project; using the offline stand-in');
+        }
+        const provider = real && m.embeddings.enabled ? getEmbeddingProvider(m.config.embeddings.provider) : null;
+        const e = await evaluateRetrieval({
+          k: Number(opts.k),
+          ...(provider ? { provider, embeddings: m.config.embeddings } : {}),
+        });
+        out(opts.json ? JSON.stringify(e, null, 2) : formatRetrievalEval(e, opts.verbose === true));
+        return;
+      }
       const b = benchmark(m, (opts.session as string) ?? null);
       out(opts.json ? JSON.stringify(b, null, 2) : formatBench(b));
     } finally {

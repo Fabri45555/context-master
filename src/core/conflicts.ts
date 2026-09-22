@@ -39,7 +39,7 @@ const COMPARABLE: ReadonlyArray<readonly [MemoryCategory, MemoryCategory]> = [
   ['architecture', 'decisions'],
 ];
 
-function comparable(a: MemoryCategory, b: MemoryCategory): boolean {
+export function comparable(a: MemoryCategory, b: MemoryCategory): boolean {
   if (a === b) return true;
   return COMPARABLE.some(([x, y]) => (x === a && y === b) || (x === b && y === a));
 }
@@ -141,8 +141,15 @@ function overlapCount(a: Set<string>, b: Set<string>): number {
   return n;
 }
 
+/**
+ * Trigram similarity at which two statements restate each other (`similar_statement`). Shared
+ * with the write-time hint in [similar.ts](similar.ts), so what `memory_remember` flags and what
+ * `memory_conflicts` reports agree.
+ */
+export const RESTATEMENT_THRESHOLD = 0.42;
+
 export function detectConflicts(items: MemoryItem[], opts: DetectOptions = {}): Conflict[] {
-  const threshold = opts.threshold ?? 0.42;
+  const threshold = opts.threshold ?? RESTATEMENT_THRESHOLD;
   const subjectFloor = opts.subjectFloor ?? 0.2;
   const minImportance = opts.minImportance ?? 'medium';
   const now = opts.now ?? Date.now();

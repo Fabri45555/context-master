@@ -231,6 +231,30 @@ export class EmbeddingIndex {
       .slice(0, limit);
   }
 
+  /**
+   * Cosine of one item's stored vector against every other active item's, by id. Reads only
+   * what `backfill` already wrote - no provider call - so it is empty for an item not yet
+   * embedded, and callers treat that as "no semantic evidence", not as dissimilar.
+   */
+  cosineTo(itemId: string): Map<string, number> {
+    const out = new Map<string, number>();
+    if (!this.enabled) return out;
+    const own = this.store.db
+      .prepare(`SELECT vec, dim FROM memory_embeddings WHERE item_id = ? AND model = ?`)
+      .get(itemId, this.config.model) as { vec: Buffer; dim: number } | undefined;
+    if (!own) return out;
+    const target = unpackVector(own.vec);
+    const rows = this.store.db
+      .prepare(
+        `SELECT e.item_id, e.vec FROM memory_embeddings e
+         JOIN memory_items m ON m.id = e.item_id
+         WHERE m.status = 'active' AND e.dim = ? AND e.model = ? AND e.item_id != ?`,
+      )
+      .all(own.dim, this.config.model, itemId) as Array<{ item_id: string; vec: Buffer }>;
+    for (const r of rows) out.set(r.item_id, cosine(target, unpackVector(r.vec)));
+    return out;
+  }
+
   count(): number {
     return (
       this.store.db.prepare(`SELECT COUNT(*) n FROM memory_embeddings`).get() as { n: number }
