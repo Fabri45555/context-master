@@ -14,9 +14,10 @@ afterEach(async () => {
   cleanup = null;
 });
 
-async function serve() {
+async function serve(setup?: (m: ReturnType<typeof makeManager>['manager']) => void) {
   const made = makeManager();
   cleanup = made.cleanup;
+  setup?.(made.manager);
   handle = await startUi(made.manager, { port: 0 });
   return handle.url;
 }
@@ -62,14 +63,67 @@ describe('dashboard server', () => {
   it('keeps every endpoint the page calls', async () => {
     const url = await serve();
     for (const path of ['/api/overview', '/api/benefits', '/api/memory', '/api/conflicts', '/api/graph',
-      '/api/events', '/api/patches', '/api/context', '/api/health']) {
+      '/api/events', '/api/patches', '/api/context', '/api/health', '/api/history',
+      '/api/overview?scope=session', '/api/benefits?scope=session']) {
       const res = await fetch(url + path);
       expect(res.status, path).toBe(200);
     }
   });
 });
 
+describe('dashboard scope', () => {
+  const traffic = (session: string, n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      hook_event_name: 'PostToolUse',
+      session_id: session,
+      tool_name: 'Read',
+      tool_input: { file_path: `/project/src/f${i}.ts` },
+      tool_response: { file: { numLines: 3 } },
+    }));
+
+  it('narrows the overview to the latest session and says which one', async () => {
+    const url = await serve((m) => {
+      m.ingestOnly('claude', traffic('old', 9), { sessionId: 'old', cwd: m.projectRoot });
+      m.store.db.prepare(`UPDATE sessions SET started_at = '2026-01-01T00:00:00.000Z' WHERE id = 'old'`).run();
+      m.ingestOnly('claude', traffic('new', 2), { sessionId: 'new', cwd: m.projectRoot });
+    });
+    type O = {
+      scope: { kind: string; session: { id: string; started_at: string } | null };
+      metrics: { events: { stored: number } };
+    };
+    const all = (await (await fetch(`${url}/api/overview`)).json()) as O;
+    const one = (await (await fetch(`${url}/api/overview?scope=session`)).json()) as O;
+    expect(all.scope).toEqual({ kind: 'all', session: null });
+    expect(one.scope.kind).toBe('session');
+    expect(one.scope.session?.id).toBe('new');
+    expect(one.metrics.events.stored).toBeLessThan(all.metrics.events.stored);
+    const b = (await (await fetch(`${url}/api/benefits?scope=session`)).json()) as { scope: O['scope'] };
+    expect(b.scope.session?.id).toBe('new');
+  });
+
+  it('answers the session scope honestly when no session exists', async () => {
+    const url = await serve();
+    const one = (await (await fetch(`${url}/api/overview?scope=session`)).json()) as { scope: unknown };
+    expect(one.scope).toEqual({ kind: 'session', session: null });
+  });
+
+  it('serves the savings history rebuilt from the log', async () => {
+    const url = await serve();
+    const h = (await (await fetch(`${url}/api/history`)).json()) as Record<string, unknown>;
+    expect(h).toMatchObject({ resumes: [], daily: [], weekly: [], tokens_avoided: 0 });
+  });
+});
+
 describe('dashboard page', () => {
+  it('keeps view settings in the hash', () => {
+    const html = renderPage();
+    // Scope and bucket size survive a refresh because they live in the hash (#overview?scope=session).
+    expect(html).toContain("overview: { scope: ['all', 'session'] }");
+    expect(html).toContain("history: { by: ['day', 'week'] }");
+    expect(html).toContain("'/api/overview' + qs");
+    expect(html).toContain("get('/api/history')");
+  });
+
   it('produces scripts that parse', () => {
     // The client script lives in a template literal; a stray backtick or dollar-brace would
     // still typecheck and only break in the browser.
