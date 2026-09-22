@@ -208,7 +208,20 @@ merely correct.
 
 ```bash
 cd your-project
+contextd mcp install            # every agent that speaks MCP; idempotent
+contextd mcp status             # where it is registered, and whether it can start
+```
 
+`--adapter claude|codex` limits it to one agent, `--scope local|project|user` picks where it is
+written, `--force` replaces a contextd entry that runs a different command. `contextd init --mcp`
+does it as part of setup. For Claude Code it runs `claude mcp add` (or edits the JSON config when
+the binary is not on PATH); for Codex it writes a `[mcp_servers.contextd]` table inside a
+`# --- contextd MCP server ---` block in `~/.codex/config.toml`, touching nothing outside it. An
+entry named `contextd` that contextd did not write is reported, never overwritten.
+
+By hand, the equivalent for Claude Code is:
+
+```bash
 claude mcp add contextd --scope local -- \
   node /absolute/path/to/context_master/dist/cli/index.js -C "$(pwd)" mcp
 ```
@@ -257,7 +270,16 @@ available until you start a new one. That is the single most common surprise.
 | `memory_status` | The metrics, as `contextd status` prints them. |
 
 There is also a resource, `contextd://memory/{category}`, for browsing a whole category without
-spending a tool call per item.
+spending a tool call per item, and `memory_query` takes an optional `category` — with no query it
+lists that category.
+
+Two answers point somewhere on purpose:
+
+- `memory_remember` names active items that say nearly the same thing ("Similar to d4 …") and how
+  to retire one. It never merges or retires anything itself.
+- When the budget leaves items out, the marker says how to get them:
+  `(+3 more omitted for budget - memory_query category="decisions")` in the bootstrap, the dropped
+  ids in a query.
 
 ### Making the agent actually use it
 
@@ -282,7 +304,7 @@ know how to do.
 ### Remove it
 
 ```bash
-claude mcp remove contextd
+contextd mcp uninstall           # this project's registrations, nothing else
 ```
 
 ---
@@ -335,6 +357,15 @@ contextd remember "Hook latency has an explicit budget; current values live in c
   --category completed_work --source agent --importance high --supersedes comp1
 ```
 
+Your own critical instructions (`source: user`, `critical`) refuse every retirement from a worker
+or an agent — that is the point of them. To retire one yourself, add `--protected` and type the id
+when asked; it only works at an interactive terminal, so an agent running the same command in its
+shell is refused:
+
+```bash
+contextd forget mem_0mucgeiti1db922250a --reason "duplicate of mem_0mucgeift9687811391" --protected
+```
+
 ### Keeping the current task current
 
 The **Current task** at the top of every bootstrap is working memory, normally written by workers.
@@ -377,23 +408,76 @@ exists, or the close is dropped.
 
 ---
 
+### Agents without hooks or MCP
+
+Some agents only read an instruction file. `contextd mirror` writes the bootstrap into one, between
+`<!-- contextd:start -->` and `<!-- contextd:end -->`, leaving the rest of the file alone:
+
+```bash
+contextd mirror                         # CLAUDE.local.md (gitignored by Claude Code convention)
+contextd mirror --target agents         # AGENTS.md, for Codex and others
+contextd mirror --check                 # exit 1 if the block is missing or stale; writes nothing
+```
+
+A target tracked by git gets a warning: the generated block would be committed. The copy uses
+absolute dates, since a file is read long after it is written. Set
+`mirror.refresh_on_maintenance: true` to rewrite it during maintenance.
+
+### Bringing in memory the agent already has
+
+```bash
+contextd import --from claude-memory --dry-run   # what would come in
+contextd import --from claude-memory [<dir>]     # ~/.claude/projects/<slug>/memory by default
+```
+
+One-way. Each memory file becomes one item (`user`/`feedback` → conventions,
+`project`/`reference` → discoveries) with `source: import` and capped confidence — never
+attributed to you. `MEMORY.md` is the index and is skipped. Re-running is a no-op; an edited file
+supersedes what it produced before; a retired import stays retired.
+
+### What it learns on its own
+
+Besides what workers extract, the fold records two things without a model:
+
+- **A fix that followed a mistake.** Within one session and one tool, a not-found path followed by
+  the right one ("`src/core/fold.js` does not exist; the file is `src/core/fold.ts`.") or a command
+  the shell rejected followed by the one that worked. Test and build failures never teach a rule:
+  a narrower passing command is not a fix.
+- **Memory pointing at files that are gone.** When every path an item names has been deleted, the
+  item goes stale (not deleted) and comes back if the file does. A protected item is only flagged,
+  and `contextd doctor` lists it for you to retire.
+
+### Every project at once
+
+```bash
+contextd status --all      # root, items, pending, recovery, hard compactions, last activity
+```
+
+Read-only. Projects are listed in `~/.contextd/projects.json` (or `$CONTEXTD_HOME`) when you run
+`init`, `attach` or `mcp install` in them; a project set up before that appears after any of the three.
+
+---
+
 ## Command reference
 
 | Command | Purpose | Notable flags |
 |---|---|---|
-| `init` | Write config, install agent hooks | `--agent`, `--global`, `--no-hooks` |
+| `init` | Write config, install agent hooks | `--agent`, `--global`, `--no-hooks`, `--mcp [scope]` |
 | `doctor` | Check ingestion, providers, budgets and the patch log | |
 | `surfaces` | How each supported agent can be ingested from | |
 | `attach` | Follow a session transcript | `--adapter`, `--transcript`, `--watch`, `--interval`, `--from-start`, `--no-worker` |
 | `run -- <agent>` | Run an agent with management attached | `--adapter`, `--interval` |
 | `hook` | Handle one hook payload on stdin (used by the hooks) | `--adapter` |
 | `ingest` | Read normalised JSONL events on stdin | `--adapter`, `--session`, `--worker` |
-| `mcp` | Serve memory over MCP on stdio | |
-| `status` | Metrics: events, memory, reduction, cost, pressure, precision | `--session`, `--json` |
+| `mcp` | Serve memory over MCP on stdio (`mcp serve`, the default) | |
+| `mcp install` / `uninstall` / `status` | Register the MCP server with each agent, remove it, or show where it is | `--adapter`, `--scope`, `--force` |
+| `uninstall` | Remove the hooks, MCP registrations and mirror blocks contextd added | `--purge`, `--yes` |
+| `mirror` | Write the bootstrap into an instruction file | `--target claude-local\|agents\|<path>`, `--check` |
+| `status` | Metrics: events, memory, reduction, cost, pressure, precision | `--session`, `--json`, `--all` |
 | `memory` | List persistent memory | `--category`, `--all`, `--json` |
-| `context [query]` | Build the context an agent should receive | `--limit`, `--json` |
+| `context [query]` | Build the context an agent should receive | `--limit`, `--category`, `--json` |
 | `remember <text>` | Record a constraint or decision by hand | `--category`, `--reason`, `--importance`, `--source user\|agent`, `--supersedes <ids>` |
-| `forget <ids...>` | Retire wrong items; kept in the patch log | `--reason` (required) |
+| `forget <ids...>` | Retire wrong items; kept in the patch log | `--reason` (required), `--protected` (your own critical items, confirmed at a terminal) |
 | `task [text]` | Show or set the current task in working memory | `--status`, `--next`, `--state`, `--plan <steps...>`, `--clear` |
 | `close <ids...>` | Mark goals / requirements / questions / issues as finished | `--reason` (required) |
 | `reopen <ids...>` | Undo a close | `--reason` (required) |
@@ -405,13 +489,13 @@ exists, or the close is dropped.
 | `reconcile` | Have a worker resolve contradictions | `--restructure`, `--no-conflicts`, `--max-runs` |
 | `graph [id]` | Typed relations between memory items | `--json` |
 | `embed` | Build the optional semantic index | `--limit`, `--all` |
-| `bench` | Managed context against the unmanaged baseline | `--session`, `--json` |
+| `bench` | Managed context against the unmanaged baseline; or retrieval quality | `--session`, `--json`, `--retrieval`, `--k`, `--verbose`, `--real-embeddings` |
 | `prune` | Apply retention and memory decay | |
 | `export` | Export memory and patch log as JSON | `--out <file>` |
-| `import <file>` | Replay an exported patch log into this project | `--force` |
+| `import [file]` | Replay an exported patch log, or import an agent's own memory | `--force`, `--from claude-memory`, `--dry-run` |
 | `reset` | Delete stored context for this project | `--events-only`, `--yes` |
 | `sessions` | List observed agent sessions | |
-| `ui` | Read-only dashboard on localhost; opens on the Benefits tab | `--port`, `--host` |
+| `ui` | Read-only dashboard on localhost | `--port`, `--host` |
 
 Global: `-C, --cwd <dir>` points any command at a different project.
 
@@ -645,10 +729,17 @@ Latency budget:       250ms (hook path)
 
 The agent is blocked while a hook runs, which is why this has a number rather than an adjective.
 
-### The Benefits view
+### The dashboard
 
-`contextd ui` opens on a **Benefits** tab that states what the tool has bought this project, each
-figure with the baseline it is measured against:
+`contextd ui` serves a read-only page on localhost with four views — **Overview**, **Memory**
+(items, conflicts, relations, a context preview), **History** and **Activity** (events, the patch
+log). The header carries a health pill backed by `GET /api/health`, the same checks as
+`contextd doctor`; click it for what is failing and how to fix it. Keys: `1`–`4` switch views, `R`
+refreshes, `/` searches memory. Old `#benefits`, `#graph`, `#events` links still land in the right
+place. Light and dark themes follow the system, with a toggle.
+
+The Overview opens with what the tool has bought this project, each figure with the baseline it is
+measured against:
 
 | Figure | Measured as |
 |---|---|
@@ -660,11 +751,11 @@ figure with the baseline it is measured against:
 | **Continuity** | recovery readiness, hard compactions, hook p95 against its budget, session starts and queries served |
 | **Guarantees enforced in code** | attributions downgraded, invented ids dropped, outputs rejected with their events kept pending |
 
-The page ends with **"Read these numbers with"**: caveats generated from the same data — no agent
+The Overview ends with **"How to read these numbers"**: caveats generated from the same data — no agent
 price configured, unpriced worker models, pending events, memory nobody has retrieved, compactions
 the ladder failed to prevent. A benefits page with no counterweight on the same screen is marketing;
 this one is meant to be quotable. Set `accounting.agent_input_cost_per_mtok` to see savings in
-dollars. Previewing a query in the dashboard's Context tab is not counted as a retrieval.
+dollars. Previewing a query in the Memory view's Context preview is not counted as a retrieval.
 
 The same data is at `GET /api/benefits` for anything that wants to chart it.
 
@@ -794,11 +885,13 @@ routed provider, the budget, hook latency, the patch log and the compaction ladd
 ## Uninstall
 
 ```bash
-claude mcp remove contextd          # unregister the MCP server
-rm -rf .context                     # delete all stored state
-rm contextd.config.json             # delete the config
-# and remove the contextd entries from .claude/settings.json
+contextd uninstall                  # hooks, MCP registrations and mirror blocks contextd added
+contextd uninstall --purge          # also .context/ and contextd.config.json - lists them, then asks
 ```
+
+Only what contextd wrote is removed: your own hooks and other MCP servers stay. The Codex block is
+shared by every project on the machine, and the command says so when it removes it. Without a
+terminal, `--purge` needs `--yes`.
 
 `contextd reset` clears the state without touching the wiring; `contextd reset --events-only` keeps
 memory and drops raw history.

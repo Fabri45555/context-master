@@ -1,0 +1,44 @@
+# contextd
+
+> Continuous context manager for AI coding agents. It watches an agent's session from outside,
+> keeps a structured persistent record of the project (goals, decisions, constraints, discoveries,
+> open issues, important files) and serves back only the part that is relevant. The agent's context
+> is disposable; the project's state is persistent. Local-first: state lives in the project's
+> `.context/` directory (SQLite); nothing leaves the machine unless you configure a remote model.
+
+Works with Claude Code (hooks + MCP) and Codex (rollout files + MCP). Node 22+.
+
+## If you were asked to set contextd up
+
+```bash
+git clone https://github.com/Fabri45555/context-master.git && cd context-master
+npm install && npm run build && npm link    # puts `contextd` on PATH
+
+cd <the user's project>
+contextd init --mcp                         # config, Claude Code hooks, MCP registration
+contextd doctor                             # every check should pass before relying on it
+contextd ui                                 # optional: the dashboard on localhost
+```
+
+The MCP server is loaded when an agent session starts: register it, then start a new session.
+For an agent with no hooks and no MCP, `contextd mirror --target agents` writes the memory into
+AGENTS.md. `contextd import --from claude-memory` brings in Claude Code's own memory files.
+`contextd uninstall` removes only what contextd added.
+
+## If you are an agent in a project that uses contextd
+
+- Start of a session: call `memory_bootstrap` before reading files. It returns the current task,
+  active constraints, decisions and open issues in a few hundred tokens.
+- Before working on an area: `memory_query` with what you are about to do.
+- When a decision, constraint or costly discovery is settled: `memory_remember`.
+- When the task changes or finishes: `memory_task`. When a goal is met: `memory_close`.
+- `memory_explain` says why an item exists; `memory_conflicts` finds contradictions;
+  `memory_retire` removes what is wrong.
+- The repository is the source of truth for code. Memory holds intent, never file contents.
+
+## Docs
+
+- [README](https://github.com/Fabri45555/context-master#readme): install, wiring, commands, configuration, numbers
+- [Invariants](https://github.com/Fabri45555/context-master/blob/master/docs/invariants.md): the rules the code enforces and the real failure behind each
+- [Landscape](https://github.com/Fabri45555/context-master/blob/master/docs/landscape.md): how it differs from other agent-memory tools
+- [PRD review](https://github.com/Fabri45555/context-master/blob/master/docs/prd-review.md): deliberate deviations from the spec

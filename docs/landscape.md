@@ -156,3 +156,29 @@ checkable by running the tests.
    workers, which never converse and never see their own previous output.
 
 None of the three blocks work here. All three could change what we claim.
+
+## 8. Borrowed from headroom
+
+[headroom](https://github.com/headroomlabs-ai/headroom) is a context *compression* layer - a proxy
+and library that shrinks what an agent reads before it reaches the model - with a memory side
+attached. Unlike the survey above, this one was read first-hand, from its source, in September 2026.
+Its core (the proxy, the JSON/code/text compressors, the CCR store of originals) is the wire §3
+declines to own. The memory side had things we lacked:
+
+| Borrowed | Theirs | Ours, and what changed on the way |
+|---|---|---|
+| Error→recovery rules | `traffic_learner.py` pairs a failure with the next success of the same tool | `src/core/recovery.ts`, far stricter: their relation check kept 281 of 2,307 real failure→success pairs, almost all wrong-cwd noise; ours keeps not-found paths and command-shape errors only (invariant 49) |
+| Similar-memory hint on write | `memory_save` answers "similar memory exists" | `findSimilar`; advice only - their background delete above 92% cosine is an unguarded retirement (invariants 12, 43) |
+| Stale file references | `_detect_staleness` checks paths against `git ls-files` | `verify_refs`, a stat per path, stale not deleted, revived when the file returns (invariant 50) |
+| MCP registration, uninstall | `mcp_registry/`, marker blocks, `unwrap` | adapters declare it; the CLI stays agent-free (invariants 15, 45) |
+| Doctor checks | version drift, stale wrap markers, routing | hook command resolves, MCP registered, embedding coverage, memory actually pulled |
+| Writing memory into instruction files | `memory/writers/` with per-agent budgets | `contextd mirror`, served but not a resume (invariant 46) |
+| Importing native memory | `bridge.py`, two-way sync with Claude auto-memory | one-way only - two-way sync is two sources of truth (invariant 47) |
+| Adaptive keyword weight | `HybridScorer` raises BM25 for UUIDs, ids | `adaptiveKeywordWeight`, also for paths and item ids (invariant 44) |
+| A retrieval handle in the "omitted" marker | CCR's `hash=` in the marker | the marker names `memory_query category=…` or the dropped ids |
+| Retrieval evaluation | LoCoMo with an LLM judge | a deterministic golden set, recall@5 and MRR, no model |
+| Dashboard layout | health pill, scope switch, label/value cards, empty states that say what to run | the four-view `contextd ui` |
+
+Refused: the proxy and output shaping (§3), auto-dedup deletion and budget pruning (unguarded
+retirement), loop counts and "known large files" as memory (invariant 28), and a telemetry
+beacon that is on unless you opt out.

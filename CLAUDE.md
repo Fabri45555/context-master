@@ -51,6 +51,7 @@ Always run `npm test` and `npm run typecheck` before claiming a change works.
 | [src/retrieval/](src/retrieval/) | Budget-aware context building |
 | [src/mcp/](src/mcp/) | MCP server — how an agent pulls context |
 | [src/ui/](src/ui/) | Read-only local dashboard (`contextd ui`) |
+| [src/ops/](src/ops/) | Install/uninstall, mirror, native-memory import, the project registry |
 | [src/cli/](src/cli/) | The `contextd` command |
 
 Memory has three levels: **L0** working memory (one row, small, always injected), **L1**
@@ -103,7 +104,16 @@ one are in [docs/invariants.md](docs/invariants.md) — read the entry before ch
 39. **Working memory states its age;** `contextd task` / `memory_task` set it.
 40. **Some successful commands are outcomes** (`isMilestoneCommand`); a Claude Bash success is exit 0.
 41. **A worker may not overwrite a task set by hand after the events it read** (`working_set_by_hand_at`).
-42. **One item may not tax every session:** the bootstrap clips items over `BOOTSTRAP_ITEM_CHARS`; queries show them whole.
+42. **One item may not tax every session:** the bootstrap clips items over `BOOTSTRAP_ITEM_CHARS`; queries show them whole; an omitted marker names the way back.
+43. **A write names its near-duplicates, never merges them** (`findSimilar`): advice, no patch.
+44. **Exact tokens trust the keyword index** (`adaptiveKeywordWeight`): paths, ids, identifiers raise it.
+45. **Only between our markers.** In files contextd does not own, write inside its block or key; never a file it cannot parse.
+46. **A copy is served, not resumed:** `mirror` goes through `serveBootstrap` as `(mirror)`, with absolute times.
+47. **An import is not the user:** `source: import`, capped confidence, deduplicated by content hash across all items.
+48. **Installers take a `HostEnv`.** Tests never touch a real home or run a real agent CLI.
+49. **A recovery is learned only from its own outcome:** same session and tool, not-found path or command-shape error.
+50. **A missing file makes memory stale, never deleted** (`verify_refs`); protected items are flagged, revived when it returns.
+51. **Only a person lifts protection:** `release_protected` from a `user` commit, typed at a TTY (`forget --protected`).
 
 ## Conventions
 

@@ -228,6 +228,69 @@ Breaking one of these breaks a PRD guarantee, so change them deliberately or not
     renders it whole, even when the bootstrap already showed its start. Whether an item was clipped
     is computed (`needsClip`), never read back from the rendered line (invariant 29).
 
+    The markers that say something was left out name the way back, so an agent is never told
+    "there is more" without being told how to get it: a bootstrap section ends with
+    `memory_query category="…"`, a query section with the dropped ids for `memory_explain`. Both
+    come from `droppedCategories` / `droppedIds`, carried through from where the budget cut them.
+
+43. **A write names its near-duplicates, never merges them.** `memory_remember` and
+    `contextd remember` answer with the closest active items (`findSimilar`: trigram similarity
+    ≥ `RESTATEMENT_THRESHOLD`, the same 0.42 `memory_conflicts` uses, or ≥ 0.9 cosine against
+    stored vectors) and how to retire one. Advice only, no patch: headroom deletes above 92% cosine
+    in the background, which is exactly the unguarded retirement invariant 12 forbids. A
+    user-critical match is reported as not retirable, since `isProtected` would reject the call.
+
+44. **Exact tokens trust the keyword index.** A query holding a path, an item id, a UUID, an
+    identifier, a version or a flag raises the keyword weight of the fusion (`adaptiveKeywordWeight`:
+    0.8 for paths/ids/UUIDs, 0.7 otherwise, never above 0.9, never lowered). With RRF k=60 and a
+    fixed 0.5, an item that is keyword rank 1 lost to a semantic rank-1 rival; `bench --retrieval`
+    shows MRR 0.885 → 0.906 on the golden fixture.
+
+45. **Only between our markers.** In a file contextd does not own (`~/.codex/config.toml`,
+    `CLAUDE.local.md`, `AGENTS.md`, `~/.claude.json`) it writes inside its own marker block or under
+    its own key, refuses to rewrite a file it cannot parse, and reports - never touches - a
+    same-named entry it did not write, `--force` or not. `uninstall` removes exactly what was added.
+
+46. **A copy is served, not resumed.** `contextd mirror` writes the bootstrap into an instruction
+    file through `serveBootstrap` labelled `(mirror)`, so it counts as serving (invariant 30) but
+    the Benefits view does not count it as a resume. The copy carries absolute times - "3h ago" is
+    true only when rendered, and a file is read much later - which is also what makes
+    `mirror --check` deterministic.
+
+47. **An import is not the user.** Items read from an agent's native memory
+    (`import --from claude-memory`) are `source: import` at confidence ≤ `MAX_INFERRED_CONFIDENCE`,
+    whatever the file says about who wrote it (invariant 26). They are deduplicated by content hash
+    against every item, not only active ones: the verbatim re-add rule (35) looks at live items, so a
+    retired import came back on the next run.
+
+48. **Installers take a `HostEnv`.** Every path into the user's machine - home, agent configs,
+    the `claude` binary - comes from a `HostEnv`; with no `which`, no external binary is called.
+    Tests never touch a real home directory or run a real agent CLI.
+
+49. **A recovery is learned only from its own outcome.** The fold turns a failure followed by a fix
+    into a rule (`src/core/recovery.ts`) only within one session and one tool, pairing each call
+    with its result by `tool_use_id` (invariant 27), and only for a not-found path or an error that
+    says the command itself was wrong - never a test or build failure, never a shell "no such file"
+    from the wrong cwd. Of 2,307 failure→success Bash pairs in 256 real transcripts, headroom's
+    relation check kept 281, almost all `cd x && …` from the wrong directory; one lesson was real.
+    A test failure followed by a narrower passing command would have taught the wrong command.
+
+50. **A missing file makes memory stale, never deleted.** `verify_refs` (a free rung, throttled on
+    the hook path) marks an item stale only when every path it names is gone, flags a protected
+    item instead (tag `stale_reference`, `fields.stale_paths`, shown by `doctor`), and revives it
+    when the file returns - a branch switch must not cost memory. It stats files; it never runs
+    `git ls-files`, a process spawn on a path with a latency budget.
+
+51. **Only a person lifts protection.** Invariant 6 was absolute, and invariant 36 then failed for
+    the one kind of item that matters most: `contextd remember` defaults to `user` + `critical`, so a
+    duplicated or mistyped instruction could be retired by no one, the user included. A patch may now
+    carry `release_protected: [ids]`, which lets its `remove` retire those items. `commitPatch`
+    rejects the field from any origin but `user` (and `import`, which replays a checked log), since a
+    worker could write it into its JSON; the MCP `memory_retire` never sets it, because the caller
+    there is the agent. `contextd forget --protected` sets it only after the id is typed at an
+    interactive terminal - an agent's shell tool is not one. The field stays in the log as the
+    record of consent, so replay rebuilds the same state.
+
 ## Metrics, in full
 
 K1 is reported as three numbers, not one: `token_reduction` (the cheap ratio), `coverage` and
