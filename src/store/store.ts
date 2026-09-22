@@ -1131,6 +1131,38 @@ export class ContextStore {
       .run(newId('ret'), sessionId, query, JSON.stringify(itemIds), tokens, new Date().toISOString());
   }
 
+  /**
+   * What agents pulled since `iso`: bootstraps and queries. A mirror write is left out - it is
+   * served, but nothing about it says an agent asked (see `contextd doctor`, "memory pulled").
+   */
+  retrievalsSince(iso: string): { bootstraps: number; queries: number; last: string | null } {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(CASE WHEN query = '(bootstrap)' THEN 1 ELSE 0 END), 0) b,
+                COALESCE(SUM(CASE WHEN query NOT IN ('(bootstrap)', '(mirror)') THEN 1 ELSE 0 END), 0) q,
+                MAX(CASE WHEN query <> '(mirror)' THEN at END) last
+         FROM retrieval_log WHERE at >= ?`,
+      )
+      .get(iso) as { b: number; q: number; last: string | null };
+    return { bootstraps: row.b, queries: row.q, last: row.last };
+  }
+
+  /** Sessions that produced events since `iso`, and the newest event overall in that window. */
+  sessionsActiveSince(iso: string): { sessions: number; last: string | null } {
+    const row = this.db
+      .prepare(`SELECT COUNT(DISTINCT session_id) n, MAX(ts) last FROM events WHERE ts >= ?`)
+      .get(iso) as { n: number; last: string | null };
+    return { sessions: row.n, last: row.last };
+  }
+
+  /** Newest thing that happened to this project: an event or a patch. */
+  lastActivity(): string | null {
+    const row = this.db
+      .prepare(`SELECT MAX(at) at FROM (SELECT MAX(ts) at FROM events UNION ALL SELECT MAX(created_at) at FROM patches)`)
+      .get() as { at: string | null };
+    return row.at;
+  }
+
   retrievalStats(): { count: number; avgTokens: number; emptyCount: number } {
     const row = this.db
       .prepare(

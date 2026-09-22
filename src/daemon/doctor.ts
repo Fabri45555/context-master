@@ -1,15 +1,20 @@
-import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { accessSync, constants } from 'node:fs';
 import {
   ADAPTERS,
+  hookInstaller,
   newestTranscript,
   preferredSurface,
+  realHost,
   type Adapter,
+  type HostEnv,
+  type InstalledHook,
+  type McpEntry,
 } from '../adapters/index.js';
 import { resolveModel, type Config, WORKER_TASKS } from '../core/config.js';
 import { getProvider } from '../workers/providers/index.js';
 import { providerIsLocal } from '../workers/providers/types.js';
+import { MCP_SERVER_NAME, servesProject } from '../ops/install.js';
+import { isOurHookCommand, resolveCommand } from '../ops/self.js';
 import type { ContextManager } from './manager.js';
 
 /**
@@ -30,18 +35,68 @@ export interface Check {
   fix?: string;
 }
 
-export function diagnose(manager: ContextManager): Check[] {
+export interface DiagnoseOptions {
+  /** The machine to inspect. Tests pass a temp home and no `which`. */
+  host?: HostEnv;
+  /** Window for "is memory being pulled". */
+  pullWindowDays?: number;
+}
+
+export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): Check[] {
   const checks: Check[] = [];
   const { config } = manager;
+  const host = opts.host ?? realHost(manager.projectRoot);
+  const wiring = inspectWiring(manager, host);
 
   checks.push(...storageChecks(manager));
-  checks.push(...adapterChecks(manager));
+  checks.push(...adapterChecks(manager, host, wiring));
+  checks.push(...mcpChecks(host, wiring));
   checks.push(...providerChecks(config));
   checks.push(...budgetChecks(config));
   checks.push(...latencyChecks(manager));
   checks.push(...integrityChecks(manager));
+  checks.push(...embeddingChecks(manager));
+  checks.push(...pullChecks(manager, wiring, opts.pullWindowDays ?? PULL_WINDOW_DAYS));
 
   return checks;
+}
+
+/** What is wired where, gathered once: several checks ask the same questions. */
+interface Wiring {
+  hooks: Map<string, { ours: InstalledHook[]; all: InstalledHook[] }>;
+  transcripts: Map<string, { path: string; mtime: number } | null>;
+  mcp: Map<string, { serving: McpEntry[]; elsewhere: McpEntry[] }>;
+}
+
+function inspectWiring(manager: ContextManager, host: HostEnv): Wiring {
+  const recorded = manager.installedHookCommand();
+  const wiring: Wiring = { hooks: new Map(), transcripts: new Map(), mcp: new Map() };
+  for (const adapter of Object.values(ADAPTERS)) {
+    const installer = hookInstaller(adapter);
+    if (installer) {
+      const all = installer.installed(host);
+      // A hand-written `contextd hook` (no -C) still counts for "is it wired"; uninstall is stricter.
+      const ours = all.filter(
+        (h) => isOurHookCommand(h.command, manager.projectRoot, recorded) || /\bcontextd\b.*\bhook\s*$/.test(h.command),
+      );
+      wiring.hooks.set(adapter.name, { ours, all });
+    }
+    if (adapter.surfaces.some((s) => s.locate)) {
+      wiring.transcripts.set(adapter.name, newestTranscript(adapter, manager.projectRoot, host.home));
+    }
+    if (adapter.mcp) {
+      const entries = adapter.mcp.get(host, MCP_SERVER_NAME);
+      wiring.mcp.set(adapter.name, {
+        serving: entries.filter((e) => servesProject(adapter, e, manager.projectRoot)),
+        elsewhere: entries.filter((e) => !servesProject(adapter, e, manager.projectRoot)),
+      });
+    }
+  }
+  return wiring;
+}
+
+function agentInUse(adapter: Adapter, wiring: Wiring): boolean {
+  return (wiring.hooks.get(adapter.name)?.ours.length ?? 0) > 0 || wiring.transcripts.get(adapter.name) != null;
 }
 
 function storageChecks(manager: ContextManager): Check[] {
@@ -67,22 +122,20 @@ function storageChecks(manager: ContextManager): Check[] {
   return out;
 }
 
-function adapterChecks(manager: ContextManager): Check[] {
+function adapterChecks(manager: ContextManager, host: HostEnv, wiring: Wiring): Check[] {
   const out: Check[] = [];
-  const home = homedir();
 
   for (const adapter of Object.values(ADAPTERS)) {
     const surface = preferredSurface(adapter);
     if (!surface) continue;
 
     if (surface.kind === 'hook') {
-      out.push(hookCheck(adapter, manager));
+      out.push(...hookChecks(adapter, host, wiring));
     }
 
     // Report the transcript surface too: it is the fallback when hooks are not installed.
-    const hasTranscriptSurface = adapter.surfaces.some((s) => s.locate);
-    if (hasTranscriptSurface) {
-      const found = newestTranscript(adapter, manager.projectRoot, home);
+    if (wiring.transcripts.has(adapter.name)) {
+      const found = wiring.transcripts.get(adapter.name) ?? null;
       out.push({
         name: `${adapter.name}: transcript`,
         status: found ? 'ok' : 'skip',
@@ -96,39 +149,141 @@ function adapterChecks(manager: ContextManager): Check[] {
   return out;
 }
 
-function hookCheck(adapter: Adapter, manager: ContextManager): Check {
+/**
+ * Whether hooks are wired - and whether the command they run can still start. `init` records the
+ * exact command, typically `node <checkout>/dist/cli/index.js -C <root> hook`; a rebuild elsewhere
+ * or a moved checkout leaves the hook pointing at nothing, and Claude Code reports a failing hook
+ * so quietly that ingestion simply stops.
+ */
+function hookChecks(adapter: Adapter, host: HostEnv, wiring: Wiring): Check[] {
   const name = `${adapter.name}: hooks`;
-  // `init` records the exact command it installed. Grepping for the word "contextd" instead
-  // would miss an install that runs `node <path>/dist/cli/index.js`, which is the normal
-  // case before the package is linked.
-  const installed = manager.installedHookCommand();
+  const ours = wiring.hooks.get(adapter.name)?.ours ?? [];
+  if (ours.length === 0) {
+    return [
+      {
+        name,
+        status: 'warn',
+        detail: 'not installed; ingestion depends on `contextd attach`',
+        fix: 'run `contextd init`',
+      },
+    ];
+  }
+  const first = ours[0]!;
+  const out: Check[] = [{ name, status: 'ok', detail: `${first.events.length} events wired in ${first.path}` }];
+  for (const command of new Set(ours.map((h) => h.command))) {
+    const r = resolveCommand(command, host);
+    out.push({
+      name: `${adapter.name}: hook command`,
+      status: r.problem ? 'fail' : 'ok',
+      detail: r.problem
+        ? `\`${command}\` cannot start: ${r.problem}; every hook fails silently`
+        : `${r.script ?? r.binaryPath ?? r.binary} resolves`,
+      ...(r.problem ? { fix: 'rebuild (`npm run build`), or re-run `contextd init` from the current install' } : {}),
+    });
+  }
+  return out;
+}
 
-  for (const dir of [join(manager.projectRoot, '.claude'), join(homedir(), '.claude')]) {
-    for (const file of ['settings.json', 'settings.local.json']) {
-      const path = join(dir, file);
-      if (!existsSync(path)) continue;
-      let hooks: string;
-      try {
-        const raw = JSON.parse(readFileSync(path, 'utf8')) as { hooks?: Record<string, unknown> };
-        hooks = JSON.stringify(raw.hooks ?? {});
-      } catch {
-        return { name, status: 'warn', detail: `${path} is not valid JSON` };
+/** The MCP server is how an agent pulls memory; hooks alone only push the bootstrap. */
+function mcpChecks(host: HostEnv, wiring: Wiring): Check[] {
+  const out: Check[] = [];
+  for (const adapter of Object.values(ADAPTERS)) {
+    const reg = wiring.mcp.get(adapter.name);
+    if (!reg) continue;
+    const name = `${adapter.name}: mcp`;
+    const fix = `run \`contextd mcp install --adapter ${adapter.name}\``;
+    if (reg.serving.length === 0) {
+      const other = reg.elsewhere.find((e) => e.managed);
+      if (other) {
+        out.push({
+          name,
+          status: 'warn',
+          detail: `registered in ${other.where} (${other.scope}) for another project: \`${[other.command, ...other.args].join(' ')}\``,
+          fix,
+        });
+      } else if (reg.elsewhere.some((e) => !e.managed)) {
+        out.push({ name, status: 'warn', detail: `a "${MCP_SERVER_NAME}" entry contextd did not write is in the way`, fix: 'inspect it with `contextd mcp status`' });
+      } else if (agentInUse(adapter, wiring)) {
+        out.push({ name, status: 'warn', detail: `not registered; ${adapter.agent} cannot query memory`, fix });
+      } else {
+        out.push({ name, status: 'skip', detail: `${adapter.agent} not used in this project` });
       }
-      const matched = installed ? hooks.includes(installed) : /contextd|contextd hook/.test(hooks);
-      if (matched) {
-        const events = Object.keys(
-          (JSON.parse(readFileSync(path, 'utf8')) as { hooks?: Record<string, unknown> }).hooks ?? {},
-        );
-        return { name, status: 'ok', detail: `${events.length} events wired in ${path}` };
-      }
+      continue;
+    }
+    for (const entry of reg.serving) {
+      const r = resolveCommand(entry, host);
+      out.push({
+        name,
+        status: r.problem ? 'fail' : 'ok',
+        detail: r.problem
+          ? `registered (${entry.scope}) but cannot start: ${r.problem}`
+          : `registered, scope ${entry.scope}, in ${entry.where}`,
+        ...(r.problem ? { fix: `${fix} --scope ${entry.scope} --force` } : {}),
+      });
     }
   }
-  return {
-    name,
-    status: 'warn',
-    detail: 'not installed; ingestion depends on `contextd attach`',
-    fix: 'run `contextd init`',
-  };
+  return out;
+}
+
+/** Semantic retrieval quietly degrades to keyword-only for every item the index lacks. */
+function embeddingChecks(manager: ContextManager): Check[] {
+  const index = manager.embeddings;
+  if (!index.enabled) return [];
+  const active = manager.store.allItems(false).filter((i) => i.status === 'active').length;
+  // `stale` reads SQL and hashes text; it never calls the embedding provider.
+  const missing = index.stale(Number.MAX_SAFE_INTEGER).length;
+  return [
+    {
+      name: 'embedding index',
+      status: missing === 0 ? 'ok' : 'warn',
+      detail:
+        missing === 0
+          ? `covers all ${active} active items (model ${index.model})`
+          : `${missing} of ${active} active items not embedded with ${index.model}; semantic search cannot find them`,
+      ...(missing === 0 ? {} : { fix: 'run `contextd embed --all`' }),
+    },
+  ];
+}
+
+const PULL_WINDOW_DAYS = 7;
+
+/**
+ * Wired is not used. Hooks can be installed and the MCP server registered while no session ever
+ * reads the memory - a SessionStart hook whose output is dropped, a server that fails to start.
+ * The retrieval log is the evidence: agent sessions with nothing served means memory is a cost
+ * with no return.
+ */
+function pullChecks(manager: ContextManager, wiring: Wiring, days: number): Check[] {
+  const wired =
+    [...wiring.hooks.values()].some((h) => h.ours.length > 0) ||
+    [...wiring.mcp.values()].some((m) => m.serving.length > 0);
+  if (!wired) return [];
+  const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  const activity = manager.store.sessionsActiveSince(since);
+  const served = manager.store.retrievalsSince(since);
+  if (activity.sessions === 0) {
+    return [{ name: 'memory pulled', status: 'skip', detail: `no agent sessions in the last ${days} days` }];
+  }
+  const total = served.bootstraps + served.queries;
+  if (total === 0) {
+    return [
+      {
+        name: 'memory pulled',
+        status: 'warn',
+        detail: `${activity.sessions} session${activity.sessions === 1 ? '' : 's'} in the last ${days} days, and no bootstrap or query was served`,
+        fix: 'check that SessionStart reaches `contextd hook` and that `contextd mcp status` shows a working server',
+      },
+    ];
+  }
+  return [
+    {
+      name: 'memory pulled',
+      status: 'ok',
+      detail:
+        `${served.bootstraps} bootstrap${served.bootstraps === 1 ? '' : 's'} and ${served.queries} quer${served.queries === 1 ? 'y' : 'ies'} ` +
+        `served across ${activity.sessions} session${activity.sessions === 1 ? '' : 's'} in the last ${days} days`,
+    },
+  ];
 }
 
 function providerChecks(config: Config): Check[] {

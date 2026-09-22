@@ -197,6 +197,19 @@ export const ConfigSchema = z.object({
    */
   embeddings: EmbeddingConfigSchema.default({}),
 
+  /** `contextd mirror` - the bootstrap copied into an instruction file for agents without hooks or MCP. */
+  mirror: z
+    .object({
+      /** A declared instruction-file target (`contextd surfaces`) or a path relative to the root. */
+      target: z.string().default('claude-local'),
+      /**
+       * Rewrite already-mirrored blocks during maintenance when they are stale. Off by default:
+       * contextd should not start editing a file the user reads because a hook fired.
+       */
+      refresh_on_maintenance: z.boolean().default(false),
+    })
+    .default({}),
+
   /** PRD 45 - context is a budgeted resource. */
   context_budget: z
     .object({
