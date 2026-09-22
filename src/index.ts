@@ -51,6 +51,12 @@ export type { Check, CheckStatus } from './daemon/doctor.js';
 export { getAdapter, ADAPTERS, ADAPTER_NAMES, claudeAdapter, codexAdapter, genericAdapter } from './adapters/index.js';
 export type { Adapter, AdapterContext, TranslateResult } from './adapters/types.js';
 export { installHooks, buildHookConfig, claudeProjectDir } from './adapters/claude/hooks.js';
+export type { HostEnv, McpRegistrar, McpEntry, McpChange, HookInstaller, InstructionFile, NativeMemorySource } from './adapters/types.js';
+export { mcpInstall, mcpUninstall, mcpStatus, uninstallWiring, MCP_SERVER_NAME } from './ops/install.js';
+export { writeMirror, checkMirror, removeMirror, MIRROR_MARKERS } from './ops/mirror.js';
+export { planNativeImport, applyNativeImport } from './ops/import-native.js';
+export { readRegistry, registerProject, registryPath } from './ops/registry.js';
+export { summarizeProject } from './ops/overview.js';
 
 export { collectMetrics, formatMetrics } from './metrics/index.js';
 export type { Metrics } from './metrics/index.js';

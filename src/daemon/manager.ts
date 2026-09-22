@@ -12,7 +12,14 @@ import { detectConflicts, type Conflict } from '../core/conflicts.js';
 import { estimateTokens } from '../core/events.js';
 import type { StatePatch } from '../core/patch.js';
 import { collectMetrics, type Metrics } from '../metrics/index.js';
-import { ContextBuilder, type BuiltContext, type QueryOptions } from '../retrieval/context-builder.js';
+import {
+  ContextBuilder,
+  type BootstrapOptions,
+  type BuiltContext,
+  type QueryOptions,
+  type ServeBootstrapOptions,
+} from '../retrieval/context-builder.js';
+import { refreshMirrors } from '../ops/mirror.js';
 import { dbPath, getMeta, openDb, setMeta } from '../store/db.js';
 import { ContextStore } from '../store/store.js';
 import { findSimilar, type SimilarHit } from '../core/similar.js';
@@ -296,13 +303,13 @@ export class ContextManager {
   // --------------------------------------------------------------- retrieval
 
   /** Measure the always-on slice. Logs nothing: use `serveBootstrap` when an agent reads it. */
-  bootstrapContext(): BuiltContext {
-    return this.builder.bootstrap();
+  bootstrapContext(opts: BootstrapOptions = {}): BuiltContext {
+    return this.builder.bootstrap(opts);
   }
 
   /** The always-on slice as delivered to an agent; counted as a retrieval. */
-  serveBootstrap(sessionId: string | null = null): BuiltContext {
-    return this.builder.serveBootstrap(sessionId);
+  serveBootstrap(sessionId: string | null = null, opts: ServeBootstrapOptions = {}): BuiltContext {
+    return this.builder.serveBootstrap(sessionId, opts);
   }
 
   /** Keyword-only and synchronous: safe inside the hook latency budget. */
@@ -478,6 +485,8 @@ export class ContextManager {
     assessment: PressureAssessment;
     performed: Array<{ action: LifecycleAction; detail: string }>;
     skipped: LifecycleAction[];
+    /** Mirror files refreshed, when `mirror.refresh_on_maintenance` is on. */
+    mirrored: string[];
   }> {
     const assessment = this.pressure(sessionId);
     const performed: Array<{ action: LifecycleAction; detail: string }> = [];
@@ -523,7 +532,11 @@ export class ContextManager {
       }
     }
 
-    return { assessment, performed, skipped };
+    // Off by default: writing into a file the user reads is not something to start doing
+    // unasked. Only blocks `contextd mirror` already wrote are refreshed, and only when stale.
+    const mirrored = this.config.mirror.refresh_on_maintenance ? safeRefresh(this) : [];
+
+    return { assessment, performed, skipped, mirrored };
   }
 
   /** PRD 43 - mark expired items stale so they stop being injected. */
@@ -596,6 +609,15 @@ export class ContextManager {
 
   close(): void {
     this.store.close();
+  }
+}
+
+/** Maintenance must not fail because a mirror file could not be written. */
+function safeRefresh(manager: ContextManager): string[] {
+  try {
+    return refreshMirrors(manager);
+  } catch {
+    return [];
   }
 }
 

@@ -51,6 +51,22 @@ export interface ContextSection {
   kind?: 'bootstrap' | 'query';
 }
 
+export interface BootstrapOptions {
+  /**
+   * Dates instead of "3h ago". For a copy written to a file: a relative age is true only at the
+   * moment it is rendered, and a file is read long after.
+   */
+  absoluteTimes?: boolean;
+}
+
+export interface ServeBootstrapOptions extends BootstrapOptions {
+  /**
+   * What the retrieval log records as the query. `(bootstrap)` is a session start, and the
+   * Benefits view counts those as resumes - so a copy served some other way must say so.
+   */
+  label?: string;
+}
+
 export interface BuiltContext {
   text: string;
   tokens: number;
@@ -229,7 +245,8 @@ export class ContextBuilder {
    * PRD 21 - the small always-available header. This is what a fresh agent reads to
    * satisfy K5: resume from repository plus memory, without the original conversation.
    */
-  bootstrap(): BuiltContext {
+  bootstrap(opts: BootstrapOptions = {}): BuiltContext {
+    const age = (iso: string) => (opts.absoluteTimes ? `at ${absoluteTime(iso)}` : describeAge(iso));
     const cb = this.config.context_budget;
     const working = this.store.workingMemory();
     const sections: ContextSection[] = [];
@@ -250,12 +267,12 @@ export class ContextBuilder {
         milestones.length > 0 ? `${milestones.length} milestone${milestones.length === 1 ? '' : 's'}` : null,
       ].filter(Boolean);
       taskLines.push(
-        `- recorded: ${describeAge(working.updated_at)}` +
+        `- recorded: ${age(working.updated_at)}` +
           (after.length > 0 ? `, ${after.join(' and ')} since - verify before relying on it` : ''),
       );
       // A commit or a push after the task was written is the likeliest sign it is finished.
       for (const m of milestones) {
-        taskLines.push(`- since then: \`${m.command.slice(0, 80)}\`${m.summary ? ` (${m.summary.slice(0, 80)})` : ''}, ${describeAge(m.at)}`);
+        taskLines.push(`- since then: \`${m.command.slice(0, 80)}\`${m.summary ? ` (${m.summary.slice(0, 80)})` : ''}, ${age(m.at)}`);
       }
     }
     if (working.current_plan.length > 0) {
@@ -288,10 +305,10 @@ export class ContextBuilder {
    * so it cannot log anything. But serving it is a retrieval: counting only `forQuery` left
    * every always-on item looking never-retrieved even though every session start read it.
    */
-  serveBootstrap(sessionId: string | null = null): BuiltContext {
-    const built = this.bootstrap();
+  serveBootstrap(sessionId: string | null = null, opts: ServeBootstrapOptions = {}): BuiltContext {
+    const built = this.bootstrap(opts);
     if (built.itemIds.length > 0 || built.text.length > 0) {
-      this.store.logRetrieval(sessionId, '(bootstrap)', built.itemIds, built.tokens);
+      this.store.logRetrieval(sessionId, opts.label ?? '(bootstrap)', built.itemIds, built.tokens);
       this.store.markUsed(built.itemIds);
     }
     return built;
@@ -368,6 +385,12 @@ function queryTitle(query: string, categories: MemoryCategory[] | undefined): st
   const cats = categories && categories.length > 0 ? categories.join(', ') : null;
   if (!cats) return `Relevant memory for: ${q}`;
   return q.length > 0 ? `Relevant memory for: ${q} (in ${cats})` : `Memory in ${cats}`;
+}
+
+/** Minute precision, UTC: stable across renders of the same state. */
+export function absoluteTime(iso: string): string {
+  const d = new Date(iso);
+  return Number.isFinite(d.getTime()) ? `${d.toISOString().slice(0, 16).replace('T', ' ')} UTC` : iso;
 }
 
 function describeAge(iso: string, now = Date.now()): string {

@@ -1,8 +1,10 @@
 import { makeEvent, type ContextEvent, type EventType, type Importance } from '../../core/events.js';
 import { contentHash, sha256 } from '../../core/ids.js';
-import type { Adapter, AdapterContext, AdapterSurface, TranslateResult } from '../types.js';
+import type { Adapter, AdapterContext, AdapterSurface, InstructionFile, TranslateResult } from '../types.js';
 import { candidatesIn } from '../discover.js';
-import { claudeProjectDir } from './hooks.js';
+import { claudeHookInstaller, claudeProjectDir } from './hooks.js';
+import { claudeMcp } from './mcp.js';
+import { claudeNativeMemory } from './memory.js';
 
 /**
  * Claude Code adapter.
@@ -124,6 +126,7 @@ export class ClaudeAdapter implements Adapter {
       installable: true,
       description:
         'Lifecycle hooks in .claude/settings.json. Synchronous for the agent, so the handler ingests and exits without calling a model.',
+      hooks: claudeHookInstaller,
     },
     {
       kind: 'transcript',
@@ -133,6 +136,18 @@ export class ClaudeAdapter implements Adapter {
       locate: (projectRoot, home) => candidatesIn(claudeProjectDir(home, projectRoot)),
     },
   ];
+
+  readonly mcp = claudeMcp;
+
+  readonly instructionFiles: readonly InstructionFile[] = [
+    {
+      target: 'claude-local',
+      path: 'CLAUDE.local.md',
+      description: 'Personal project instructions Claude Code loads every session; gitignored by convention',
+    },
+  ];
+
+  readonly nativeMemory = claudeNativeMemory;
 
   /** Only `Stop` marks a finished turn whose usage is now written to the transcript. */
   usageSource(hookPayload: unknown): string | null {

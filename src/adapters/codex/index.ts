@@ -1,7 +1,8 @@
 import { makeEvent, type ContextEvent, type EventType } from '../../core/events.js';
 import { contentHash } from '../../core/ids.js';
 import { join } from 'node:path';
-import type { Adapter, AdapterContext, AdapterSurface, TranslateResult } from '../types.js';
+import type { Adapter, AdapterContext, AdapterSurface, InstructionFile, TranslateResult } from '../types.js';
+import { codexMcp } from './mcp.js';
 import { candidatesIn, firstRecord } from '../discover.js';
 
 /**
@@ -33,6 +34,16 @@ export class CodexAdapter implements Adapter {
         candidatesIn(join(home, '.codex', 'sessions'), 3).filter((c) =>
           sessionCwd(c.path) === projectRoot,
         ),
+    },
+  ];
+
+  readonly mcp = codexMcp;
+
+  readonly instructionFiles: readonly InstructionFile[] = [
+    {
+      target: 'agents',
+      path: 'AGENTS.md',
+      description: 'Project instructions read by Codex and other agents following the AGENTS.md convention; usually committed',
     },
   ];
 

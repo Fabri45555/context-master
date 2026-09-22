@@ -298,7 +298,9 @@ describe('a worker that records nothing', () => {
       const streak = manager.store.emptyRunStreak();
       expect(streak.streak).toBeGreaterThanOrEqual(3);
 
-      const check = diagnose(manager).find((c) => c.name === 'worker output');
+      // A home inside the temp project: doctor must not read the real one.
+      const host = { projectRoot: manager.projectRoot, home: manager.projectRoot };
+      const check = diagnose(manager, { host }).find((c) => c.name === 'worker output');
       expect(check?.status).toBe('fail');
       expect(check?.detail).toContain('recorded nothing');
     } finally {

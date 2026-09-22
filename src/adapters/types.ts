@@ -1,4 +1,5 @@
-import type { ContextEvent } from '../core/events.js';
+import type { ContextEvent, Importance } from '../core/events.js';
+import type { MemoryCategory } from '../core/state.js';
 
 /**
  * PRD 22 - the adapter layer. Everything agent-specific lives behind this interface so the
@@ -64,6 +65,142 @@ export interface AdapterSurface {
    * particular agent stores its logs.
    */
   locate?(projectRoot: string, home: string): TranscriptCandidate[];
+  /** For `hook` surfaces: how `init` wires them and `uninstall` unwires them. */
+  hooks?: HookInstaller;
+}
+
+// ------------------------------------------------------------------ installation
+
+/**
+ * Everything an installer may touch derives from this, so a test can point it at a temp dir and
+ * never reach the real home directory or the real agent binary.
+ */
+export interface HostEnv {
+  projectRoot: string;
+  home: string;
+  /** Environment variables an agent uses to relocate its config (CLAUDE_CONFIG_DIR, CODEX_HOME). */
+  vars?: Readonly<Record<string, string | undefined>>;
+  /** Locate an executable. Absent means "no external binaries": installers fall back to files. */
+  which?: (bin: string) => string | null;
+  /** Run a binary synchronously. Only called for a binary `which` found. */
+  exec?: CommandRunner;
+}
+
+export type CommandRunner = (
+  bin: string,
+  args: readonly string[],
+  opts?: { cwd?: string },
+) => { status: number | null; stdout: string; stderr: string };
+
+export interface InstalledHook {
+  path: string;
+  command: string;
+  events: string[];
+}
+
+export interface HookInstaller {
+  /** Where hooks go; `global` means the user-level settings rather than the project's. */
+  install(
+    env: HostEnv,
+    opts: { command: string; global?: boolean },
+  ): { path: string; created: boolean; preserved: string[] };
+  /** Every hook command wired for this agent, ours or not, with the file it lives in. */
+  installed(env: HostEnv): InstalledHook[];
+  /** Remove the hook entries whose command `isOurs` accepts, and nothing else. */
+  uninstall(env: HostEnv, isOurs: (command: string) => boolean): Array<{ path: string; events: string[] }>;
+}
+
+/** How to start the contextd CLI: a command plus the arguments before the subcommand. */
+export interface Launch {
+  command: string;
+  args: readonly string[];
+}
+
+export interface McpEntry {
+  scope: string;
+  /** The file the registration lives in. */
+  where: string;
+  command: string;
+  args: string[];
+  /** False for an entry contextd did not write (outside its markers); it is never modified. */
+  managed: boolean;
+}
+
+export type McpChangeStatus =
+  | 'registered'
+  | 'already'
+  | 'updated'
+  | 'conflict'
+  | 'removed'
+  | 'absent'
+  | 'failed';
+
+export interface McpChange {
+  status: McpChangeStatus;
+  scope: string;
+  where: string;
+  detail: string;
+}
+
+/**
+ * How an agent learns that an MCP server exists. Each agent invented its own config file and
+ * format, so this is declared by the adapter next to its `surfaces` - the CLI only knows the verbs.
+ */
+export interface McpRegistrar {
+  description: string;
+  scopes: readonly string[];
+  defaultScope: string;
+  /**
+   * Whether an entry in this scope names the project (`-C <root>`). A server started with an
+   * unpredictable working directory must be told which memory to serve; a scope whose config is
+   * global cannot pin one project without serving it everywhere.
+   */
+  pinsProject(scope: string): boolean;
+  /** The command and arguments a registration in `scope` would carry. */
+  entryFor(env: HostEnv, launch: Launch, scope: string): { command: string; args: string[] };
+  /** Registrations named `name`, in `scope` or in every scope. */
+  get(env: HostEnv, name: string, scope?: string): McpEntry[];
+  /** Idempotent. A different existing entry is a `conflict` unless `force`; foreign entries never change. */
+  register(env: HostEnv, name: string, launch: Launch, scope: string, opts?: { force?: boolean }): McpChange;
+  /** Removes only an entry contextd wrote. */
+  unregister(env: HostEnv, name: string, scope: string): McpChange;
+}
+
+/** A file an agent reads as standing instructions, where `contextd mirror` can write memory. */
+export interface InstructionFile {
+  /** Name used on the command line, e.g. `contextd mirror --target <target>`. */
+  target: string;
+  /** Relative to the project root. */
+  path: string;
+  description: string;
+}
+
+/** One memory the agent wrote in its own format, translated but not yet committed. */
+export interface NativeMemoryEntry {
+  /** Absolute path of the file it came from. */
+  file: string;
+  /** Stable identity across edits (the file name), so a changed file replaces its import. */
+  key: string;
+  /** Hash of the file content: unchanged content is not imported twice. */
+  hash: string;
+  /** The agent's own classification, kept for explainability. */
+  nativeType: string | null;
+  /** The name the agent gave it, if any. */
+  title: string | null;
+  category: MemoryCategory;
+  importance: Importance;
+  text: string;
+  detail: string | null;
+}
+
+/** An agent's own persistent memory, readable for a one-way import. */
+export interface NativeMemorySource {
+  /** Name used on the command line: `contextd import --from <name>`. */
+  name: string;
+  description: string;
+  /** Default directory for this project. */
+  locate(projectRoot: string, home: string): string;
+  read(dir: string): { entries: NativeMemoryEntry[]; skipped: Array<{ file: string; reason: string }> };
 }
 
 export interface Adapter {
@@ -81,6 +218,12 @@ export interface Adapter {
    * rung. The manager reads the tail of this file generically; only the adapter knows it exists.
    */
   usageSource?(hookPayload: unknown): string | null;
+  /** How to register the contextd MCP server with this agent, if it speaks MCP. */
+  readonly mcp?: McpRegistrar;
+  /** Instruction files this agent reads on its own, for `contextd mirror`. */
+  readonly instructionFiles?: readonly InstructionFile[];
+  /** The agent's own memory store, for `contextd import --from`. */
+  readonly nativeMemory?: NativeMemorySource;
 }
 
 export function noEvents(): TranslateResult {
@@ -105,4 +248,9 @@ export function newestTranscript(
     }
   }
   return best;
+}
+
+/** The installer of this adapter's hook surface, if it has one. */
+export function hookInstaller(adapter: Adapter): HookInstaller | null {
+  return adapter.surfaces.find((s) => s.hooks)?.hooks ?? null;
 }

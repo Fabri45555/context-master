@@ -8,12 +8,31 @@ import {
   ADAPTER_NAMES,
   ADAPTERS,
   getAdapter,
+  hookInstaller,
+  instructionFiles,
+  mcpAdapters,
+  nativeMemorySources,
   newestTranscript,
   preferredSurface,
+  realHost,
   sessionIdFromFilename,
+  type McpChange,
 } from '../adapters/index.js';
-import { installHooks } from '../adapters/claude/hooks.js';
 import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/state.js';
+import { isOurHookCommand, launchString, selfLaunch } from '../ops/self.js';
+import { registerProject, readRegistry, registryPath, unregisterProject } from '../ops/registry.js';
+import { mcpInstall, mcpStatus, mcpUninstall, purge, purgeTargets, uninstallWiring } from '../ops/install.js';
+import {
+  candidateMirrorFiles,
+  checkMirror,
+  mirrorCreatedFiles,
+  isTrackedByGit,
+  resolveMirrorTarget,
+  writeMirror,
+} from '../ops/mirror.js';
+import { applyNativeImport, planNativeImport } from '../ops/import-native.js';
+import { formatOverview, summarizeProject } from '../ops/overview.js';
+import { createInterface } from 'node:readline/promises';
 import { StatePatchSchema } from '../core/patch.js';
 import { CONFIG_FILENAMES, findConfigFile, type WorkerTask } from '../core/config.js';
 import { ContextManager } from '../daemon/manager.js';
@@ -81,9 +100,10 @@ function parseJsonl(text: string): unknown[] {
 program
   .command('init')
   .description('create a config file and wire up the agent hooks')
-  .option('--agent <name>', 'agent to wire up (claude)', 'claude')
-  .option('--global', 'install hooks in ~/.claude instead of ./.claude', false)
+  .option('--agent <name>', `adapter to wire up (${ADAPTER_NAMES.join('|')})`, 'claude')
+  .option('--global', 'install hooks in the user-level settings instead of the project', false)
   .option('--no-hooks', 'write the config only')
+  .option('--mcp [scope]', 'also register the MCP server for this agent (default scope: the adapter\'s)')
   .action((opts, cmd) => {
     const cwd = resolve((cmd.optsWithGlobals().cwd as string) ?? process.cwd());
     const existing = findConfigFile(cwd);
@@ -103,31 +123,58 @@ program
 
     const m = new ContextManager({ cwd });
     out(`storage at ${m.storageDir}`);
+    const recorded = m.installedHookCommand();
+    const root = m.projectRoot;
+    noteProject(m);
     m.close();
 
-    if (opts.hooks === false) return;
-    if (opts.agent !== 'claude') {
-      out(`no hook installer for agent "${opts.agent}" yet; use "contextd attach" or "contextd ingest"`);
-      return;
+    const adapter = getAdapter(opts.agent as string);
+    const host = realHost(root);
+    if (opts.hooks !== false) {
+      const installer = hookInstaller(adapter);
+      if (!installer) {
+        out(`${adapter.agent} has no hook surface; use "contextd attach" or "contextd ingest"`);
+      } else {
+        const hookCommand = `${launchString(selfLaunch())} -C ${cwd} hook`;
+        // A hook left over from a build that has since moved would otherwise count as "someone
+        // else's hook" and block the new one; ours are recognised by shape and replaced.
+        const stale = installer.uninstall(
+          host,
+          (c) => c !== hookCommand && isOurHookCommand(c, root, recorded),
+        );
+        for (const s of stale) out(`replaced the previous contextd hook in ${s.path}`);
+        const res = installer.install(host, { command: hookCommand, global: opts.global === true });
+        const recorder = new ContextManager({ cwd });
+        recorder.noteInstalledHookCommand(hookCommand);
+        recorder.close();
+        out(`${res.created ? 'created' : 'updated'} ${res.path}`);
+        if (res.preserved.length > 0) {
+          out(`left your existing hooks alone for: ${res.preserved.join(', ')}`);
+          out('add the contextd hook to those events manually if you want them ingested');
+        }
+      }
     }
-    const settingsDir = opts.global ? join(homedir(), '.claude') : join(cwd, '.claude');
-    const hookCommand = `${resolveSelfCommand()} -C ${cwd} hook`;
-    const res = installHooks(settingsDir, { command: hookCommand });
-    const recorder = new ContextManager({ cwd });
-    recorder.noteInstalledHookCommand(hookCommand);
-    recorder.close();
-    out(`${res.created ? 'created' : 'updated'} ${res.path}`);
-    if (res.preserved.length > 0) {
-      out(`left your existing hooks alone for: ${res.preserved.join(', ')}`);
-      out('add the contextd hook to those events manually if you want them ingested');
+
+    if (opts.mcp !== undefined) {
+      if (!adapter.mcp) {
+        out(`${adapter.agent} has no MCP registration surface`);
+        return;
+      }
+      const scope = typeof opts.mcp === 'string' ? opts.mcp : undefined;
+      printMcpChange(adapter.name, mcpInstall(host, adapter, selfLaunch(), { ...(scope ? { scope } : {}) }));
+    } else if (adapter.mcp) {
+      out(`to let ${adapter.agent} query memory: contextd mcp install --adapter ${adapter.name}`);
     }
   });
 
-/** Prefer the installed binary; fall back to running this very file with node. */
-function resolveSelfCommand(): string {
-  const self = process.argv[1];
-  if (self && self.endsWith('.js') && existsSync(self)) return `node ${self}`;
-  return 'contextd';
+/** Record the project in the user-level registry for `status --all`. Never fails the caller. */
+function noteProject(m: ContextManager): void {
+  registerProject(registryPath(homedir(), process.env), m.projectRoot, m.storageDir);
+}
+
+function printMcpChange(adapter: string, c: McpChange): void {
+  out(`${adapter}: ${c.status.padEnd(10)} [${c.scope}] ${c.detail}`);
+  if (c.status === 'conflict' || c.status === 'failed') process.exitCode = 1;
 }
 
 // ------------------------------------------------------------------ hook
@@ -238,6 +285,7 @@ program
   .option('--no-worker', 'ingest only, never spawn a worker')
   .action(async (opts, cmd) => {
     const m = manager(cmd);
+    noteProject(m);
     try {
       const found = opts.transcript
         ? { path: resolve(opts.transcript as string), sessionId: sessionIdFromFilename(resolve(opts.transcript as string)) ?? 'unknown' }
@@ -355,7 +403,14 @@ program
   .description('show context manager metrics')
   .option('--session <id>', 'limit to one session')
   .option('--json', 'machine-readable output', false)
+  .option('--all', 'one line per project contextd knows on this machine (read-only)', false)
   .action((opts, cmd) => {
+    if (opts.all === true) {
+      // Deliberately no manager for the current directory: that would create storage here.
+      const rows = readRegistry(registryPath(homedir(), process.env)).map(summarizeProject);
+      out(opts.json ? JSON.stringify(rows, null, 2) : formatOverview(rows));
+      return;
+    }
     const m = manager(cmd);
     try {
       const metrics = m.metrics((opts.session as string) ?? null);
@@ -851,12 +906,56 @@ program
 
 program
   .command('import')
-  .description('replay an exported patch log into this project')
-  .argument('<file>', 'a file produced by `contextd export`')
+  .description('replay an exported patch log, or import an agent\'s own memory (--from)')
+  .argument('[file]', 'a file produced by `contextd export`; with --from, the directory to read')
   .option('--force', 'apply patches even if their items already exist', false)
-  .action((file: string, opts, cmd) => {
+  .option(
+    '--from <source>',
+    `one-way import of an agent's native memory (${nativeMemorySources().map((s) => s.name).join('|')})`,
+  )
+  .option('--dry-run', 'with --from: show what would be imported, change nothing', false)
+  .action((file: string | undefined, opts, cmd) => {
     const m = manager(cmd);
     try {
+      if (opts.from) {
+        const source = nativeMemorySources().find((s) => s.name === opts.from);
+        if (!source) {
+          out(`unknown source "${opts.from}" (available: ${nativeMemorySources().map((s) => s.name).join(', ')})`);
+          process.exitCode = 1;
+          return;
+        }
+        const dir = file ? resolve(file) : source.locate(m.projectRoot, homedir());
+        if (!existsSync(dir)) {
+          out(`nothing to import: ${dir} does not exist`);
+          return;
+        }
+        const plan = planNativeImport(m.store, source, dir);
+        out(`${source.name}: ${dir}`);
+        for (const c of plan.changes) {
+          const verb = c.action === 'add' ? '+ add    ' : c.action === 'replace' ? '~ replace' : '~ refresh';
+          out(`${verb} [${c.entry.category}] ${c.entry.text.slice(0, 100)}${c.previous ? `  (was ${c.previous.id})` : ''}`);
+        }
+        for (const s of plan.skipped) out(`  skip   ${s.file.split('/').pop()} (${s.reason})`);
+        out(`${plan.changes.length} to import, ${plan.unchanged.length} unchanged since the last import`);
+        if (opts.dryRun === true) {
+          out('dry run: nothing was written');
+          return;
+        }
+        const r = applyNativeImport(m, plan);
+        if (!r.ok) {
+          out(`rejected: ${r.violations.join('; ')}`);
+          process.exitCode = 1;
+          return;
+        }
+        if (r.nothingNew) out('nothing new: already in memory');
+        else out(`imported: ${r.added.length} added, ${r.updated.length} updated (state v${r.version}), source "import"`);
+        return;
+      }
+      if (!file) {
+        out('pass a file from `contextd export`, or --from <source>');
+        process.exitCode = 1;
+        return;
+      }
       const raw = JSON.parse(readFileSync(resolve(file), 'utf8')) as {
         patches?: Array<{ patch: unknown; origin?: string; note?: string | null }>;
       };
@@ -988,13 +1087,183 @@ program
 
 // -------------------------------------------------------------------- mcp
 
-program
-  .command('mcp')
+const mcp = program.command('mcp').description('serve memory over MCP (default), or manage its registration');
+
+mcp
+  .command('serve', { isDefault: true })
   .description('serve project memory over MCP on stdio')
   .action(async (_opts, cmd) => {
     const m = manager(cmd);
     // stdout is the MCP transport from here on; anything else would corrupt the stream.
     await runMcpStdio(m);
+  });
+
+function projectRootOf(cmd: Command): string {
+  const m = manager(cmd);
+  const root = m.projectRoot;
+  m.close();
+  return root;
+}
+
+mcp
+  .command('install')
+  .description('register the contextd MCP server with an agent (idempotent)')
+  .option('--adapter <name>', 'only this agent; default every agent that speaks MCP')
+  .option('--scope <scope>', "where to register; default the adapter's own default")
+  .option('--force', 'replace an existing contextd entry that runs a different command', false)
+  .action((opts, cmd) => {
+    const m = manager(cmd);
+    noteProject(m);
+    const host = realHost(m.projectRoot);
+    m.close();
+    const launch = selfLaunch();
+    for (const adapter of mcpAdapters(opts.adapter as string | undefined)) {
+      try {
+        printMcpChange(
+          adapter.name,
+          mcpInstall(host, adapter, launch, {
+            ...(opts.scope ? { scope: opts.scope as string } : {}),
+            force: opts.force === true,
+          }),
+        );
+      } catch (err) {
+        out(`${adapter.name}: ${(err as Error).message}`);
+        process.exitCode = 1;
+      }
+    }
+    out('start a new agent session for the server to load');
+  });
+
+mcp
+  .command('uninstall')
+  .description("remove this project's contextd MCP registrations (nothing else)")
+  .option('--adapter <name>', 'only this agent')
+  .option('--scope <scope>', 'only this scope')
+  .action((opts, cmd) => {
+    const host = realHost(projectRootOf(cmd));
+    for (const adapter of mcpAdapters(opts.adapter as string | undefined)) {
+      const changes = mcpUninstall(host, adapter, opts.scope as string | undefined);
+      if (changes.length === 0) out(`${adapter.name}: absent     not registered`);
+      for (const c of changes) printMcpChange(adapter.name, c);
+    }
+  });
+
+mcp
+  .command('status')
+  .description('where the contextd MCP server is registered, and whether it can start')
+  .option('--adapter <name>', 'only this agent')
+  .option('--json', 'machine-readable output', false)
+  .action((opts, cmd) => {
+    const host = realHost(projectRootOf(cmd));
+    const status = mcpStatus(host, mcpAdapters(opts.adapter as string | undefined));
+    if (opts.json) {
+      out(JSON.stringify(status, null, 2));
+      return;
+    }
+    for (const r of status.rows) {
+      const flags = [
+        r.entry.managed ? null : 'not written by contextd',
+        r.servesThisProject ? 'serves this project' : 'another project',
+        r.resolution?.problem ? `BROKEN: ${r.resolution.problem}` : null,
+      ].filter(Boolean);
+      out(`${r.adapter}: [${r.entry.scope}] ${r.entry.where}`);
+      if (r.entry.managed) out(`    ${[r.entry.command, ...r.entry.args].join(' ')}`);
+      out(`    ${flags.join(' · ')}`);
+    }
+    for (const name of status.missing) out(`${name}: not registered  (contextd mcp install --adapter ${name})`);
+  });
+
+// -------------------------------------------------------------- uninstall
+
+program
+  .command('uninstall')
+  .description('remove the hooks, MCP registrations and mirror blocks contextd added; keeps .context unless --purge')
+  .option('--purge', 'also delete the stored memory and the config file', false)
+  .option('--yes', 'confirm --purge without a prompt (required when not a terminal)', false)
+  .action(async (opts, cmd) => {
+    const m = manager(cmd);
+    const root = m.projectRoot;
+    const recordedHook = m.installedHookCommand();
+    const storageDir = m.storageDir;
+    const mirrorFiles = candidateMirrorFiles(m);
+    const mirrorCreated = mirrorCreatedFiles(m);
+    const doomed = opts.purge === true ? purgeTargets(m.storageDir, m.loaded.path) : [];
+    m.close();
+
+    // Confirm before touching anything, so a declined purge leaves the wiring as it was too.
+    if (doomed.length > 0) {
+      out('--purge deletes:');
+      for (const p of doomed) out(`  ${p}`);
+      if (opts.yes !== true) {
+        if (!process.stdin.isTTY) {
+          out('not a terminal: re-run with --yes to confirm');
+          process.exitCode = 1;
+          return;
+        }
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const answer = (await rl.question('delete these? [y/N] ')).trim().toLowerCase();
+        rl.close();
+        if (answer !== 'y' && answer !== 'yes') {
+          out('nothing changed');
+          return;
+        }
+      }
+    }
+
+    const report = uninstallWiring({
+      env: realHost(root),
+      adapters: Object.values(ADAPTERS),
+      recordedHook,
+      mirrorFiles,
+      mirrorCreated,
+    });
+    for (const h of report.hooks) out(`${h.adapter}: removed hooks (${h.events.join(', ')}) from ${h.path}`);
+    for (const { adapter, change } of report.mcp) printMcpChange(adapter, change);
+    for (const mm of report.mirrors) out(`mirror: ${mm.result === 'deleted' ? 'deleted' : 'removed the block from'} ${mm.path}`);
+    if (report.hooks.length + report.mcp.length + report.mirrors.length === 0) out('no contextd wiring found');
+
+    if (doomed.length > 0) {
+      purge(doomed);
+      unregisterProject(registryPath(homedir(), process.env), root);
+      for (const p of doomed) out(`deleted ${p}`);
+    } else {
+      out(`project memory kept in ${storageDir} (use --purge to delete it)`);
+    }
+  });
+
+// ----------------------------------------------------------------- mirror
+
+program
+  .command('mirror')
+  .description('write the bootstrap into an instruction file the agent already reads')
+  .option(
+    '--target <name|path>',
+    `${instructionFiles().map((f) => `${f.target} (${f.path})`).join(', ')}, or a path; default config mirror.target`,
+  )
+  .option('--check', 'exit non-zero if the block is missing or stale; writes nothing', false)
+  .action((opts, cmd) => {
+    const m = manager(cmd);
+    try {
+      const target = (opts.target as string | undefined) ?? m.config.mirror.target;
+      const path = resolveMirrorTarget(target, m.projectRoot);
+      if (opts.check === true) {
+        const c = checkMirror(m, path);
+        out(`${c.stale ? 'stale' : 'fresh'}: ${path} (${c.reason})`);
+        if (c.stale) process.exitCode = 1;
+        return;
+      }
+      const w = writeMirror(m, path);
+      out(
+        w.changed
+          ? `${w.created ? 'created' : 'updated'} ${path} (${w.tokens} tokens of memory)`
+          : `${path} is already up to date`,
+      );
+      if (isTrackedByGit(realHost(m.projectRoot), path)) {
+        out(`warning: ${path} is tracked by git; the generated block will be committed and change on every refresh`);
+      }
+    } finally {
+      m.close();
+    }
   });
 
 // ------------------------------------------------------------------- graph
@@ -1119,6 +1388,18 @@ program
           .join(', ');
         out(`  [${flags}]`);
         out(`    ${s.description}`);
+      }
+      if (adapter.mcp) {
+        out(`  [mcp: ${adapter.mcp.scopes.join('|')}, default ${adapter.mcp.defaultScope}]`);
+        out(`    ${adapter.mcp.description}`);
+      }
+      for (const f of adapter.instructionFiles ?? []) {
+        out(`  [mirror target: ${f.target}]`);
+        out(`    ${f.path} - ${f.description}`);
+      }
+      if (adapter.nativeMemory) {
+        out(`  [import --from ${adapter.nativeMemory.name}]`);
+        out(`    ${adapter.nativeMemory.description}`);
       }
       out('');
     }
