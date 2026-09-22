@@ -1,8 +1,17 @@
 import type { Config } from '../core/config.js';
 import { estimateTokens } from '../core/events.js';
+import { isClosed } from '../core/patch.js';
 import type { MemoryCategory, MemoryItem } from '../core/state.js';
 import type { ContextStore } from '../store/store.js';
 import { RetrievalEngine, type ScoredItem } from '../store/retrieval.js';
+import type { EmbeddingIndex } from '../store/embeddings.js';
+
+export interface QueryOptions {
+  limit?: number;
+  sessionId?: string | null;
+  /** false for a preview that never reaches an agent - see `serveQuery`. */
+  record?: boolean;
+}
 
 /**
  * PRD 21 / 45 - the context builder.
@@ -26,6 +35,8 @@ export interface ContextSection {
    * could never move off 100%.
    */
   itemIds: string[];
+  /** Items shown only in part (see BOOTSTRAP_ITEM_CHARS); a query may render them again in full. */
+  clippedIds?: string[];
 }
 
 export interface BuiltContext {
@@ -76,14 +87,46 @@ const CATEGORY_TAG: Record<string, string> = {
   important_files: 'file',
 };
 
-function renderItem(i: MemoryItem, tagCategory = false): string {
+/**
+ * The most one item may cost in the always-on slice, in characters.
+ *
+ * Every session pays for the bootstrap, so one item written as a paragraph taxes all of them: a
+ * single 558-character decision plus its reason took the bootstrap from 425 to 775 tokens. Past
+ * this, the bootstrap shows the start and the id; the whole item is one `memory_explain` away, and
+ * queries still render it in full.
+ */
+export const BOOTSTRAP_ITEM_CHARS = 240;
+
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const space = cut.lastIndexOf(' ');
+  return `${cut.slice(0, space > max * 0.6 ? space : max).trimEnd()}…`;
+}
+
+/** Whether the always-on slice would show only part of this item. */
+function needsClip(i: MemoryItem, maxChars: number | undefined): boolean {
+  if (maxChars == null || i.category === 'important_files') return false;
+  const reason = i.category === 'decisions' && typeof i.fields.reason === 'string' ? i.fields.reason : i.reason;
+  return (reason ? `${i.text} (why: ${reason})` : i.text).length > maxChars;
+}
+
+function renderItem(i: MemoryItem, tagCategory = false, maxChars?: number): string {
+  if (maxChars != null && needsClip(i, maxChars)) {
+    const marks = [i.importance === 'critical' ? '[critical]' : null, `[${i.id}]`].filter(Boolean);
+    return `- ${clip(i.text, maxChars)} (full: memory_explain ${i.id}) ${marks.join(' ')}`;
+  }
   const bits: string[] = [];
   if (i.category === 'important_files') {
     const purpose = typeof i.fields.purpose === 'string' ? i.fields.purpose : null;
     const path = typeof i.fields.path === 'string' ? i.fields.path : i.text;
     return `- ${path}${purpose ? ` — ${purpose}` : ''} [${i.id}]`;
   }
-  bits.push(tagCategory ? `- (${CATEGORY_TAG[i.category] ?? i.category}) ${i.text}` : `- ${i.text}`);
+  const tag = `${CATEGORY_TAG[i.category] ?? i.category}${isClosed(i) ? ', done' : ''}`;
+  bits.push(tagCategory ? `- (${tag}) ${i.text}` : `- ${i.text}`);
+  if (tagCategory && isClosed(i) && typeof i.fields.closed_reason === 'string') {
+    bits.push(`(closed: ${i.fields.closed_reason})`);
+  }
   if (i.category === 'decisions' && typeof i.fields.reason === 'string') {
     bits.push(`(why: ${i.fields.reason})`);
   } else if (i.reason) {
@@ -96,13 +139,20 @@ function renderItem(i: MemoryItem, tagCategory = false): string {
 }
 
 /** Fill a section up to its token allowance, reporting what did not fit. */
-function pack(title: string, items: MemoryItem[], allowance: number, tagCategory = false): ContextSection {
+function pack(
+  title: string,
+  items: MemoryItem[],
+  allowance: number,
+  tagCategory = false,
+  maxChars?: number,
+): ContextSection {
   const lines: string[] = [];
   const itemIds: string[] = [];
+  const clippedIds: string[] = [];
   let tokens = estimateTokens(title) + 2;
   let dropped = 0;
   for (const item of items) {
-    const line = renderItem(item, tagCategory);
+    const line = renderItem(item, tagCategory, maxChars);
     const cost = estimateTokens(line);
     if (tokens + cost > allowance) {
       dropped += 1;
@@ -110,9 +160,10 @@ function pack(title: string, items: MemoryItem[], allowance: number, tagCategory
     }
     lines.push(line);
     itemIds.push(item.id);
+    if (needsClip(item, maxChars)) clippedIds.push(item.id);
     tokens += cost;
   }
-  return { title, lines, tokens, dropped, itemIds };
+  return { title, lines, tokens, dropped, itemIds, clippedIds };
 }
 
 function sectionText(s: ContextSection): string {
@@ -146,6 +197,24 @@ export class ContextBuilder {
     taskLines.push(`- status: ${working.task_status}`);
     if (working.current_state) taskLines.push(`- state: ${working.current_state}`);
     if (working.next_action) taskLines.push(`- next action: ${working.next_action}`);
+    // Stated so the reader can weigh it: a task recorded hours and many user turns ago is a claim
+    // about the past. Without this a stale "blocked: waiting for commit" read as current.
+    if (working.updated_at && (working.current_task || working.next_action)) {
+      const since = this.store.userMessagesSince(working.updated_at);
+      const milestones = this.store.milestonesSince(working.updated_at, 3);
+      const after = [
+        since > 0 ? `${since} user message${since === 1 ? '' : 's'}` : null,
+        milestones.length > 0 ? `${milestones.length} milestone${milestones.length === 1 ? '' : 's'}` : null,
+      ].filter(Boolean);
+      taskLines.push(
+        `- recorded: ${describeAge(working.updated_at)}` +
+          (after.length > 0 ? `, ${after.join(' and ')} since - verify before relying on it` : ''),
+      );
+      // A commit or a push after the task was written is the likeliest sign it is finished.
+      for (const m of milestones) {
+        taskLines.push(`- since then: \`${m.command.slice(0, 80)}\`${m.summary ? ` (${m.summary.slice(0, 80)})` : ''}, ${describeAge(m.at)}`);
+      }
+    }
     if (working.current_plan.length > 0) {
       taskLines.push(...working.current_plan.map((p, n) => `- plan ${n + 1}. ${p}`));
     }
@@ -163,7 +232,7 @@ export class ContextBuilder {
 
     for (const s of BOOTSTRAP_SECTIONS) {
       const items = eligible(s.categories.flatMap((c) => this.retrieval.byCategory(c)));
-      sections.push(pack(s.title, items, cb.sections[s.budget]));
+      sections.push(pack(s.title, items, cb.sections[s.budget], false, BOOTSTRAP_ITEM_CHARS));
     }
 
     return this.finish(sections, cb.total_tokens - cb.reserve_for_retrieval);
@@ -189,17 +258,34 @@ export class ContextBuilder {
    * PRD 46 - query-scoped retrieval. Always-on critical items are included unconditionally
    * so a narrow query cannot accidentally hide a user constraint.
    */
-  forQuery(
-    query: string,
-    opts: { limit?: number; sessionId?: string | null; record?: boolean } = {},
-  ): BuiltContext {
+  forQuery(query: string, opts: QueryOptions = {}): BuiltContext {
+    return this.serveQuery(query, this.retrieval.search(query, { limit: opts.limit ?? 12 }), opts);
+  }
+
+  /**
+   * `forQuery` with the semantic list fused in. Async because embedding the query is a provider
+   * call, which is why the hook path never comes here (invariant 17).
+   *
+   * The index is brought up to date first, so an item written a minute ago is findable by
+   * meaning without anyone running `contextd embed`. When that refresh reports the provider
+   * unreachable, the query goes keyword-only at once rather than waiting out a second timeout.
+   */
+  async forQueryHybrid(query: string, index: EmbeddingIndex, opts: QueryOptions = {}): Promise<BuiltContext> {
+    const limit = opts.limit ?? 12;
+    if (!index.enabled) return this.forQuery(query, opts);
+    const refreshed = await index.backfill();
+    if (refreshed.error && refreshed.failed > 0) return this.forQuery(query, opts);
+    return this.serveQuery(query, await this.retrieval.searchHybrid(query, index, { limit }), opts);
+  }
+
+  private serveQuery(query: string, found: ScoredItem[], opts: QueryOptions): BuiltContext {
     const cb = this.config.context_budget;
     const base = this.bootstrap();
 
-    const alwaysIds = new Set(base.itemIds);
-    const hits: ScoredItem[] = this.retrieval
-      .search(query, { limit: opts.limit ?? 12 })
-      .filter((h) => !alwaysIds.has(h.item.id));
+    // Already on screen - unless the bootstrap only showed the start of it.
+    const clipped = new Set(base.sections.flatMap((s) => s.clippedIds ?? []));
+    const alwaysIds = new Set(base.itemIds.filter((id) => !clipped.has(id)));
+    const hits = found.filter((h) => !alwaysIds.has(h.item.id));
 
     const relevant = pack(
       `Relevant memory for: ${query.slice(0, 120)}`,
@@ -233,6 +319,14 @@ export class ContextBuilder {
   }
 }
 
+function describeAge(iso: string, now = Date.now()): string {
+  const mins = Math.max(0, Math.round((now - Date.parse(iso)) / 60_000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
 /**
  * Whether an item has earned a place in the slice every session pays for.
  *
@@ -241,6 +335,10 @@ export class ContextBuilder {
  * moved: it stays retrievable by query, where its uncertainty is cheap.
  */
 export function alwaysOnEligible(item: MemoryItem, minConfidence: number): boolean {
+  // A met goal or an answered question is history: still findable by query, not orientation.
+  // This comes before the user/critical rule on purpose - closing is the one way a protected
+  // item leaves the slice without being weakened.
+  if (isClosed(item)) return false;
   if (item.source === 'user' || item.importance === 'critical') return true;
   return item.confidence >= minConfidence;
 }

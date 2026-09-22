@@ -166,7 +166,11 @@ export class WorkerRunner {
         // only ask the same question again.
         const commit = Object.keys(patch).length === 0
           ? null
-          : this.store.commitPatch(patch, 'worker', { sessionId, workerRunId: runId });
+          : this.store.commitPatch(patch, 'worker', {
+              sessionId,
+              workerRunId: runId,
+              observedUntil: forModel.reduce<string | null>((m, e) => (m == null || e.timestamp > m ? e.timestamp : m), null),
+            });
         if (commit == null || (!commit.ok && commit.violations.every((v) => v.code === 'empty_patch'))) {
           const cost = priceUsage(spec, usage);
           this.store.finishWorkerRun(runId, {

@@ -70,6 +70,29 @@ export const UnlinkSchema = z.object({
   kind: EdgeKindSchema.optional(),
 });
 
+/**
+ * Mark a goal met, a requirement satisfied, a question answered or an issue resolved.
+ *
+ * Not a status change: the item stays `active`, keeps its protection, and stays reachable by
+ * query as history. It only leaves the always-on slice. Two sessions in a row reported every goal
+ * as still open with the work visibly done, because nothing could say otherwise - and retiring a
+ * user goal is exactly what `isProtected` forbids.
+ */
+export const CloseSchema = z.object({
+  id: z.string(),
+  /** What closed it. Required: "done" with no reason is not a record anyone can check. */
+  reason: z.string().min(1),
+  /** Event ids showing it happened. A worker closing a user-critical item must cite one. */
+  evidence: z.array(z.string()).optional(),
+});
+
+/** Categories whose items can be finished. A constraint or a decision is never "done". */
+export const CLOSABLE_CATEGORIES = ['goals', 'requirements', 'open_questions', 'known_issues'] as const;
+
+export function isClosed(item: MemoryItem): boolean {
+  return typeof item.fields.closed_at === 'string';
+}
+
 export const StatePatchSchema = z.object({
   /** Optimistic concurrency: reject if state moved on since the worker read it. */
   base_version: z.number().int().nonnegative().optional(),
@@ -84,6 +107,9 @@ export const StatePatchSchema = z.object({
   /** PRD 56 - state a typed relation between two items. */
   link: z.array(LinkSchema).optional(),
   unlink: z.array(UnlinkSchema).optional(),
+  close: z.array(CloseSchema).optional(),
+  /** Undo a close: the goal turned out not to be met after all. */
+  reopen: z.array(z.string()).optional(),
   /** Free-form note explaining the patch, shown in `contextd inspect`. */
   note: z.string().optional(),
 });
@@ -102,6 +128,7 @@ export interface PatchViolation {
     | 'duplicate_id'
     | 'self_supersede'
     | 'self_link'
+    | 'not_closable'
     /** The response was not a patch at all: no JSON, bad JSON, or a shape nothing can fix. */
     | 'unparsable_response';
   message: string;
@@ -147,7 +174,9 @@ export function isEmptyPatch(p: StatePatch): boolean {
     !p.supersede?.length &&
     !p.touch?.length &&
     !p.link?.length &&
-    !p.unlink?.length
+    !p.unlink?.length &&
+    !p.close?.length &&
+    !p.reopen?.length
   );
 }
 
@@ -230,6 +259,11 @@ export function pruneInertOperations(
   if (patch.unlink?.length) {
     for (const e of patch.unlink) if (!bothEndsKnown(e)) dropped.push(`unlink ${e.from}->${e.to}`);
     out.unlink = patch.unlink.filter(bothEndsKnown);
+  }
+  if (patch.close?.length) {
+    const keep = patch.close.filter((c) => known.has(c.id));
+    for (const c of patch.close) if (!known.has(c.id)) dropped.push(`close ${c.id}`);
+    out.close = keep;
   }
   if (patch.touch?.length) {
     const keep = patch.touch.filter((id) => known.has(id));
@@ -369,6 +403,22 @@ export function validatePatch(patch: StatePatch, state: ProjectState): PatchViol
     }
   }
 
+  for (const c of patch.close ?? []) {
+    const target = byId.get(c.id);
+    if (!target) {
+      violations.push({ code: 'unknown_item', message: `close targets unknown id ${c.id}`, ref: c.id });
+    } else if (!(CLOSABLE_CATEGORIES as readonly string[]).includes(target.category)) {
+      violations.push({
+        code: 'not_closable',
+        message: `${c.id} is a ${target.category} item; only ${CLOSABLE_CATEGORIES.join(', ')} can be closed`,
+        ref: c.id,
+      });
+    }
+  }
+  for (const id of patch.reopen ?? []) {
+    if (!byId.has(id)) violations.push({ code: 'unknown_item', message: `reopen targets unknown id ${id}`, ref: id });
+  }
+
   return violations;
 }
 
@@ -484,6 +534,27 @@ export function applyPatch(state: ProjectState, patch: StatePatch, now = new Dat
     if (n == null) continue;
     items[n] = { ...items[n]!, last_validated_at: iso };
     touched.push(id);
+  }
+
+  for (const c of patch.close ?? []) {
+    const n = index.get(c.id);
+    if (n == null) continue;
+    const prev = items[n]!;
+    items[n] = {
+      ...prev,
+      fields: { ...prev.fields, closed_at: iso, closed_reason: c.reason },
+      evidence: [...new Set([...prev.evidence, ...(c.evidence ?? [])])],
+      updated_at: iso,
+    };
+    updated.push(c.id);
+  }
+
+  for (const id of patch.reopen ?? []) {
+    const n = index.get(id);
+    if (n == null) continue;
+    const { closed_at: _at, closed_reason: _why, ...fields } = items[n]!.fields;
+    items[n] = { ...items[n]!, fields, updated_at: iso };
+    updated.push(id);
   }
 
   const working = patch.working

@@ -767,7 +767,47 @@ Two defects found in the dashboard while building the Benefits view: its Context
 human preview as a retrieval (moving `never_retrieved` by being looked at), and "tokens avoided"
 credited empty retrievals. Both fixed; the page carries its own caveats.
 
-Open, deliberately: a user goal is `critical` and therefore permanent even once it is done (the
-README request is still in every bootstrap). Letting any caller retire it would let an agent with a
-shell delete user constraints, which is exactly what `isProtected` exists to prevent. The right
-shape is probably a `done` status that leaves the item protected but out of the always-on slice.
+A user goal is `critical` and therefore permanent even once it is done; a second, independent
+session found the same gap on its first question ("all five goals still read as open"). Letting any
+caller retire it would let an agent with a shell delete user constraints. Resolved with `close`: the
+item stays active and protected, leaves the bootstrap, and answers queries as `done` with its
+reason. A worker must cite a real event to close a user-critical goal. The same session also misread
+a discovery (`disc2`, a fixed bug) as an open issue and proposed retiring it, because query results
+carried no category; they now do (`(discovery, historical)`).
+
+The same session's working memory still read "Commit project repository: blocked" after the commit
+had been made in the other session. A commit is a successful shell command, which the fold closes as
+inert, so no worker ever saw the task end - and working memory had no writer but a worker. The
+bootstrap now prints the task's age and the user messages since it was recorded, `doctor` warns at
+five (it fired at 16 on this project), and `contextd task` / `memory_task` set it directly.
+
+Follow-up: successful milestone commands (commit, push, merge, tag, PR, publish) now reach a worker
+and appear under the task in the bootstrap. Building it exposed that no successful Claude Bash
+command had ever carried an exit code - success is `{stdout, stderr, interrupted:false}` - so the
+fold could not tell a finished commit from an unknown one.
+
+## 26. What the savings figure should have said
+
+The first Benefits view reported **1.0M tokens / $15.56 saved**. It compared every delivery of
+memory with the agent's 519k peak. Two things were wrong with that. Nobody re-reads a whole
+conversation to resume. And eight of the ten deliveries were queries inside a session that already
+held its context, which avoid nothing. Measured turn by turn, the one real resume (a new session)
+started at 51k tokens of which the bootstrap was 425, and answered "what did I ask, what is left"
+correctly for +3.6k.
+
+The figure now counts **resumes only** (bootstrap deliveries, with the hook and `memory_bootstrap`
+serving the same one merged within ten minutes) and prices each against re-reading the project's
+own `.md` documents, measured. On this project that is 1 resume and about $0.56, 28× less than the
+first claim. The page says what that comparison leaves out: the user's requests are in none of
+those documents, so the alternative to memory is not more expensive, it is incomplete.
+
+The same analysis found the largest fixed cost was not contextd but `CLAUDE.md`: 5.2k tokens in
+every session, 12× the bootstrap, mostly the history behind each invariant. That history moved
+verbatim to [invariants.md](invariants.md); `CLAUDE.md` keeps one line per rule (2.1k tokens).
+
+Draining the last 19 pending events surfaced two more. The worker rewrote the current task back to
+"Commit project repository: blocked" over a task set by hand after those events - last write wins
+on a one-row table. And one 558-character decision written over MCP had grown the bootstrap by about
+250 tokens. Fixed by invariants 41 and 42; the item was split into four statements that supersede
+it. The bootstrap is still larger than at first (684 tokens) because memory holds more decisions
+now, which is what the per-section budgets exist to bound.

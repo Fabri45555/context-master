@@ -411,11 +411,12 @@ program
   .argument('[query...]', 'what you are about to work on')
   .option('--limit <n>', 'max retrieved items', '12')
   .option('--json', 'machine-readable output', false)
-  .action((queryParts: string[], opts, cmd) => {
+  .action(async (queryParts: string[], opts, cmd) => {
     const m = manager(cmd);
     try {
       const query = queryParts.join(' ').trim();
-      const built = query.length > 0 ? m.queryContext(query, { limit: Number(opts.limit) }) : m.bootstrapContext();
+      const built =
+        query.length > 0 ? await m.queryContextHybrid(query, { limit: Number(opts.limit) }) : m.bootstrapContext();
       if (opts.json) {
         out(JSON.stringify(built, null, 2));
         return;
@@ -716,6 +717,88 @@ program
         return;
       }
       out(`retired ${ids.join(', ')} (state v${result.version})`);
+    } finally {
+      m.close();
+    }
+  });
+
+program
+  .command('task')
+  .description('show or set the current task in working memory')
+  .argument('[text...]', 'the task; omit to show the current one')
+  .option('--status <s>', 'unknown|planning|in_progress|blocked|review|done')
+  .option('--next <action>', 'the next concrete action')
+  .option('--state <text>', 'where things stand')
+  .option('--plan <steps...>', 'replace the plan with these steps')
+  .option('--clear', 'clear task, state, next action and plan')
+  .action((textParts: string[], opts, cmd) => {
+    const m = manager(cmd);
+    try {
+      const text = textParts.join(' ').trim();
+      const change = opts.clear
+        ? { current_task: null, task_status: 'unknown' as const, current_state: null, next_action: null, current_plan: [] }
+        : {
+            ...(text ? { current_task: text } : {}),
+            ...(opts.status ? { task_status: opts.status } : {}),
+            ...(opts.next ? { next_action: opts.next as string } : {}),
+            ...(opts.state ? { current_state: opts.state as string } : {}),
+            ...(opts.plan ? { current_plan: opts.plan as string[] } : {}),
+          };
+      if (Object.keys(change).length > 0) {
+        const result = m.setTask(change);
+        if (!result.ok) {
+          out(`rejected: ${result.violations.map((v) => `${v.code} ${v.message}`).join('; ')}`);
+          process.exitCode = 1;
+          return;
+        }
+      }
+      const w = m.store.workingMemory();
+      out(`task:    ${w.current_task ?? '(none)'}`);
+      out(`status:  ${w.task_status}`);
+      if (w.current_state) out(`state:   ${w.current_state}`);
+      if (w.next_action) out(`next:    ${w.next_action}`);
+      for (const [n, p] of w.current_plan.entries()) out(`plan ${n + 1}:  ${p}`);
+      out(`updated: ${w.updated_at ?? 'never'}`);
+    } finally {
+      m.close();
+    }
+  });
+
+program
+  .command('close')
+  .description('mark goals met, requirements satisfied, questions answered or issues resolved')
+  .argument('<ids...>', 'ids of the items to close')
+  .requiredOption('--reason <what>', 'what closed them - kept with the item')
+  .action((ids: string[], opts, cmd) => {
+    const m = manager(cmd);
+    try {
+      const result = m.closeItems(ids, opts.reason as string);
+      if (!result.ok) {
+        out(`rejected: ${result.violations.map((v) => `${v.code} ${v.message}`).join('; ')}`);
+        process.exitCode = 1;
+        return;
+      }
+      out(`closed ${ids.join(', ')} (state v${result.version}); still findable by query`);
+    } finally {
+      m.close();
+    }
+  });
+
+program
+  .command('reopen')
+  .description('undo a close: the goal was not met after all')
+  .argument('<ids...>', 'ids of the items to reopen')
+  .requiredOption('--reason <why>', 'why it is open again')
+  .action((ids: string[], opts, cmd) => {
+    const m = manager(cmd);
+    try {
+      const result = m.reopenItems(ids, opts.reason as string);
+      if (!result.ok) {
+        out(`rejected: ${result.violations.map((v) => `${v.code} ${v.message}`).join('; ')}`);
+        process.exitCode = 1;
+        return;
+      }
+      out(`reopened ${ids.join(', ')} (state v${result.version})`);
     } finally {
       m.close();
     }

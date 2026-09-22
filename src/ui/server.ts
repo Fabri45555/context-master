@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { collectBenefits } from '../metrics/benefits.js';
 import { collectMetrics } from '../metrics/index.js';
@@ -26,6 +27,9 @@ export interface UiHandle {
   url: string;
   close(): Promise<void>;
 }
+
+/** Identifies the page this build serves; hashed without itself, which it then embeds. */
+const PAGE_VERSION = createHash('sha256').update(renderPage()).digest('hex').slice(0, 12);
 
 export function startUi(manager: ContextManager, opts: UiOptions = {}): Promise<UiHandle> {
   const host = opts.host ?? '127.0.0.1';
@@ -70,7 +74,7 @@ async function handle(
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
         });
-        res.end(renderPage());
+        res.end(renderPage(PAGE_VERSION));
         return;
 
       case '/favicon.svg': {
@@ -97,7 +101,7 @@ async function handle(
         send(res, 200, {
           root: manager.projectRoot,
           metrics,
-          benefits: collectBenefits(manager.store, manager.config, metrics),
+          benefits: collectBenefits(manager.store, manager.config, metrics, manager.projectRoot),
         });
         return;
       }
@@ -124,7 +128,9 @@ async function handle(
 
       case '/api/context': {
         const q = url.searchParams.get('q');
-        const built = q ? manager.queryContext(q, { limit: 15, record: false }) : manager.bootstrapContext();
+        const built = q
+          ? await manager.queryContextHybrid(q, { limit: 15, record: false })
+          : manager.bootstrapContext();
         send(res, 200, { query: q, ...built });
         return;
       }
@@ -142,6 +148,7 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    'x-page-version': PAGE_VERSION,
   });
   res.end(text);
 }
@@ -156,6 +163,7 @@ function overview(manager: ContextManager) {
     edges: manager.store.edgeCount(),
     embeddings: { enabled: manager.embeddings.enabled, count: manager.embeddings.count() },
     conflicts: manager.conflicts({ maxPairs: 50 }).length,
+    never_retrieved_history: manager.store.neverRetrievedHistory(),
     machine: manager.config.limits,
   };
 }

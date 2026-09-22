@@ -5,7 +5,7 @@
  * that owns the store, so a dependency on an external asset host would be the only way for
  * this to leak anything.
  */
-export function renderPage(): string {
+export function renderPage(version = ''): string {
   return `<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
@@ -104,6 +104,13 @@ export function renderPage(): string {
   .checks .mark.warn { color: var(--warn); }
   .caveats { border: 1px solid var(--warn); border-radius: 8px; padding: 12px 16px; }
   .caveats li { margin: 5px 0; }
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: auto; touch-action: pan-y; }
+  .chart .tip { position: absolute; display: none; pointer-events: none; transform: translate(-50%, -100%);
+                background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+                padding: 6px 9px; font-size: 12px; white-space: nowrap; }
+  .chart .tip b { font-variant-numeric: tabular-nums; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin: 8px 0; }
   @media (max-width: 560px) { main, header, nav { padding-left: 14px; padding-right: 14px; } }
 </style>
 </head>
@@ -121,6 +128,13 @@ const TABS = [
   ['graph', 'Graph'], ['context', 'Context'], ['events', 'Events'], ['patches', 'Patches'],
 ];
 let current = location.hash.slice(1) || 'benefits';
+/*
+ * The page is one long-lived script that only ever refetches data, so after a rebuild an open
+ * tab keeps running the old code against the new server: the fix that stopped refreshes from
+ * rebuilding the panel shipped, and a tab opened earlier kept rebuilding it. The server stamps every response
+ * with the version of the page it would serve now; on a mismatch, reload once for that version.
+ */
+const PAGE_VERSION = ${JSON.stringify(version)};
 const panel = document.getElementById('panel');
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -130,6 +144,16 @@ const pct = (x) => (typeof x === 'number' ? (x * 100).toFixed(1) + '%' : '–');
 
 async function get(path) {
   const res = await fetch(path);
+  const served = res.headers.get('x-page-version');
+  if (PAGE_VERSION && served && served !== PAGE_VERSION) {
+    let seen = null;
+    try { seen = sessionStorage.getItem('reloaded-for'); } catch {}
+    // Once per version: a mismatch that survives a reload must not become a reload loop.
+    if (seen !== served) {
+      try { sessionStorage.setItem('reloaded-for', served); } catch {}
+      location.reload();
+    }
+  }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
   return res.json();
 }
@@ -184,15 +208,16 @@ async function drawBenefits() {
   let html = '<div class="hero">';
   html += r.smaller_by != null
     ? claim(times(r.smaller_by) + ' smaller',
-        'A new session resumes with <b>' + num(r.bootstrap_tokens) + '</b> tokens of project state instead of the <b>' +
-        num(r.agent_peak_tokens) + '</b> the agent was carrying.',
-        'measured: bootstrap size vs the largest context the agent reported', true)
+        'The project state fits in <b>' + num(r.bootstrap_tokens) + '</b> tokens; the conversation it was distilled from reached <b>' +
+        num(r.agent_peak_tokens) + '</b>.',
+        'a size comparison, not a saving: nobody would re-read the whole conversation', true)
     : claim(num(r.bootstrap_tokens), 'tokens to resume the project in a fresh session.',
         'no agent turn observed yet, so there is nothing measured to compare against', false);
-  html += claim(compact(dl.tokens_avoided),
-      'tokens the agent did not have to re-read, over <b>' + num(dl.total - dl.empty) + '</b> deliveries of memory' +
-      (dl.usd_avoided != null ? ' &mdash; about <b>$' + dl.usd_avoided.toFixed(2) + '</b>' : '') + '.',
-      'upper bound: per delivery, agent peak minus what was served', dl.tokens_avoided > 0);
+  html += claim(dl.usd_avoided != null ? '$' + dl.usd_avoided.toFixed(2) : compact(dl.tokens_avoided),
+      (dl.usd_avoided != null ? '(' + compact(dl.tokens_avoided) + ' tokens) ' : 'tokens ') +
+      'not spent re-reading the documentation, over <b>' + num(dl.resumes) + '</b> resume' + (dl.resumes === 1 ? '' : 's') +
+      ' from memory' + (dl.worker_usd > 0 ? '; workers cost <b>$' + dl.worker_usd.toFixed(2) + '</b>' : '') + '.',
+      'per resume: ' + num(dl.rebuild_tokens) + ' tokens of project .md files minus the bootstrap', dl.tokens_avoided > 0);
   html += claim(pct(t.share_by_code),
       'of <b>' + num(t.events) + '</b> events were settled by code, never reaching a model.',
       'discarded at ingest or closed by the deterministic fold', t.share_by_code > 0.5);
@@ -239,7 +264,7 @@ async function drawBenefits() {
     check(c.hook_p95_ms == null || c.hook_p95_ms <= c.hook_budget_ms, c.hook_p95_ms == null
       ? 'No hook latency measured yet.'
       : 'Invisible to the agent: hooks answer in ' + Math.round(c.hook_p95_ms) + 'ms at p95, budget ' + c.hook_budget_ms + 'ms.') +
-    check(dl.total > 0, num(dl.bootstrap) + ' session start(s) and ' + num(dl.query) + ' targeted quer' + (dl.query === 1 ? 'y' : 'ies') +
+    check(dl.total > 0, num(dl.resumes) + ' resume(s) from memory and ' + num(dl.query) + ' targeted quer' + (dl.query === 1 ? 'y' : 'ies') +
       ' served from memory across ' + num(c.sessions) + ' session(s).') +
     '</ul>';
 
@@ -255,7 +280,7 @@ async function drawBenefits() {
     html += '<h2>Read these numbers with</h2><div class="caveats"><ul>' +
       b.caveats.map((x) => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
   }
-  panel.innerHTML = html;
+  return html;
 }
 
 async function drawOverview() {
@@ -304,10 +329,113 @@ async function drawOverview() {
     ['unverified', pct(m.precision.unverified_ratio)],
   ]);
 
+  const trend = neverRetrievedChart(d.never_retrieved_history || []);
+  html += '<h2>Never retrieved over time</h2>' +
+    '<p class="muted" style="margin:-4px 0 10px">Share of memory items never served to an agent &mdash; lower is better. ' +
+    'Rebuilt from the retrieval log, so history starts with the first item.</p>' + trend.html;
+
   html += '<h2>Sessions</h2>' + table(['started', 'source', 'events', 'id'],
     d.sessions.map((s) => [esc(s.started_at), esc(s.source), num(s.events),
       '<code>' + esc(s.id) + '</code>']));
-  panel.innerHTML = html;
+  return { html, after: trend.wire };
+}
+
+/**
+ * A step line, not a sloped one: the ratio only moves when an item is created or first served,
+ * and holds exactly between those instants. Interpolating would invent values that never existed.
+ */
+let chartPointer = null;
+
+function neverRetrievedChart(points) {
+  if (points.length < 2) {
+    return { html: '<div class="empty">not enough history yet</div>', wire() {} };
+  }
+  // Draw at the panel's real width so text stays 11px instead of scaling with the viewBox;
+  // the overview redraws on a timer, which also picks up a resize.
+  const W = Math.max(300, Math.min(960, panel.clientWidth - 38)), H = 200, L = 40, R = 60, T = 12, B = 26;
+  const ratio = (p) => (p.total ? p.never / p.total : 0);
+  const t0 = Date.parse(points[0].at);
+  // Run to now: the last value still holds, and ending at the last change hides how long it has.
+  // Rounded to the minute, or the markup would differ on every refresh and always repaint.
+  const t1 = Math.max(Date.parse(points[points.length - 1].at), Math.ceil(Date.now() / 60e3) * 60e3);
+  const span = Math.max(1, t1 - t0);
+  const x = (t) => L + ((t - t0) / span) * (W - L - R);
+  const y = (r) => T + (1 - r) * (H - T - B);
+  const xs = points.map((p) => x(Date.parse(p.at)));
+  const ys = points.map((p) => y(ratio(p)));
+
+  let path = 'M' + xs[0].toFixed(1) + ' ' + ys[0].toFixed(1);
+  for (let i = 1; i < points.length; i += 1) path += 'H' + xs[i].toFixed(1) + 'V' + ys[i].toFixed(1);
+  path += 'H' + x(t1).toFixed(1);
+
+  const when = (t) => {
+    const dt = new Date(t);
+    return span < 36 * 3600e3
+      ? dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  };
+  let grid = '';
+  for (const r of [0, 0.25, 0.5, 0.75, 1]) {
+    grid += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(r) + '" y2="' + y(r) +
+      '" stroke="var(--line)" stroke-width="1"/>' +
+      '<text x="' + (L - 8) + '" y="' + (y(r) + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">' +
+      r * 100 + '%</text>';
+  }
+  for (const [t, anchor] of [[t0, 'start'], [t0 + span / 2, 'middle'], [t1, 'end']]) {
+    grid += '<text x="' + x(t) + '" y="' + (H - 6) + '" text-anchor="' + anchor +
+      '" fill="var(--muted)" font-size="11">' + esc(when(t)) + '</text>';
+  }
+
+  const last = points[points.length - 1];
+  const lx = x(t1), ly = ys[ys.length - 1];
+  const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="never retrieved share over time, now ' +
+    pct(ratio(last)) + '">' + grid +
+    '<path d="' + path + '" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>' +
+    '<circle cx="' + lx + '" cy="' + ly + '" r="4" fill="var(--accent)" stroke="var(--panel)" stroke-width="2"/>' +
+    '<text x="' + (lx + 8) + '" y="' + (ly + 4) + '" fill="var(--ink)" font-size="12">' + pct(ratio(last)) + '</text>' +
+    '<line class="xh" y1="' + T + '" y2="' + (H - B) + '" stroke="var(--muted)" stroke-width="1" visibility="hidden"/>' +
+    '<circle class="xd" r="4" fill="var(--accent)" stroke="var(--panel)" stroke-width="2" visibility="hidden"/>' +
+    '<rect class="hit" x="' + L + '" y="0" width="' + (W - L - R) + '" height="' + H + '" fill="transparent"/>' +
+    '</svg>';
+
+  const rows = points.slice(-30).reverse().map((p) => [
+    '<span class="mono">' + esc(new Date(p.at).toLocaleString()) + '</span>',
+    pct(ratio(p)), num(p.never) + ' / ' + num(p.total),
+  ]);
+  const html = '<div class="chart" id="nr-chart">' + svg + '<div class="tip"></div></div>' +
+    '<details><summary>data (last ' + rows.length + ' changes)</summary>' +
+    table(['changed at', 'never retrieved', 'items'], rows) + '</details>';
+
+  function wire() {
+    const box = document.getElementById('nr-chart');
+    if (!box) return;
+    const el = box.querySelector('svg'), tip = box.querySelector('.tip');
+    const xh = el.querySelector('.xh'), xd = el.querySelector('.xd');
+    const hide = () => { tip.style.display = 'none'; xh.setAttribute('visibility', 'hidden'); xd.setAttribute('visibility', 'hidden'); };
+    el.addEventListener('pointerleave', () => { chartPointer = null; hide(); });
+    el.addEventListener('pointermove', (ev) => {
+      chartPointer = { clientX: ev.clientX, clientY: ev.clientY };
+      const rect = el.getBoundingClientRect();
+      const vx = ((ev.clientX - rect.left) / rect.width) * W;
+      if (vx < L || vx > W - R) { hide(); return; }
+      // The value under the pointer is the step that began at or before it.
+      let i = 0;
+      while (i + 1 < xs.length && xs[i + 1] <= vx) i += 1;
+      const p = points[i];
+      xh.setAttribute('x1', xs[i]); xh.setAttribute('x2', xs[i]); xh.setAttribute('visibility', 'visible');
+      xd.setAttribute('cx', xs[i]); xd.setAttribute('cy', ys[i]); xd.setAttribute('visibility', 'visible');
+      const sx = rect.width / W;
+      tip.innerHTML = '<b>' + pct(ratio(p)) + '</b> never retrieved<br><span class="muted">' +
+        num(p.never) + ' of ' + num(p.total) + ' items &middot; ' + esc(new Date(p.at).toLocaleString()) + '</span>';
+      tip.style.display = 'block';
+      const half = tip.offsetWidth / 2;
+      tip.style.left = Math.min(rect.width - half, Math.max(half, xs[i] * sx)) + 'px';
+      tip.style.top = (ys[i] * sx - 10) + 'px';
+    });
+    // The x axis runs to now, so the chart repaints on every refresh; put the tooltip back.
+    if (chartPointer) el.dispatchEvent(new PointerEvent('pointermove', chartPointer));
+  }
+  return { html, wire };
 }
 
 async function drawMemory() {
@@ -327,13 +455,13 @@ async function drawMemory() {
       ]));
   }
   if (!d.items.length) html += '<div class="empty">no memory recorded yet</div>';
-  panel.innerHTML = html;
+  return html;
 }
 
 async function drawConflicts() {
   const list = await get('/api/conflicts');
-  if (!list.length) { panel.innerHTML = '<div class="empty">no contradictions detected</div>'; return; }
-  panel.innerHTML = '<h2>' + list.length + ' contradiction(s)</h2>' + list.map((c, n) =>
+  if (!list.length) return '<div class="empty">no contradictions detected</div>';
+  return '<h2>' + list.length + ' contradiction(s)</h2>' + list.map((c, n) =>
     '<div class="pair"><div class="muted">' + (n + 1) + '. ' + esc(c.reason) +
     ' · similarity ' + c.similarity.toFixed(2) + ' · ' +
     esc(c.a.category === c.b.category ? c.a.category : c.a.category + ' vs ' + c.b.category) + '</div>' +
@@ -347,9 +475,8 @@ async function drawConflicts() {
 async function drawGraph() {
   const d = await get('/api/graph');
   if (!d.edges.length) {
-    panel.innerHTML = '<div class="empty">no relations recorded yet<br>' +
+    return '<div class="empty">no relations recorded yet<br>' +
       '<span class="mono">workers add these as they extract memory</span></div>';
-    return;
   }
   // Circular layout: no layout library, and the graph is small enough to read this way.
   const R = 150, cx = 200, cy = 190;
@@ -370,7 +497,7 @@ async function drawGraph() {
     return '<circle cx="' + p.x + '" cy="' + p.y + '" r="5" fill="' + fill + '"><title>' +
       esc(nd.category + ': ' + nd.text) + '</title></circle>';
   }).join('');
-  panel.innerHTML = '<h2>' + d.nodes.length + ' linked items, ' + d.edges.length + ' relations</h2>' +
+  return '<h2>' + d.nodes.length + ' linked items, ' + d.edges.length + ' relations</h2>' +
     '<svg viewBox="0 0 400 380" width="400" height="380" role="img" aria-label="memory relation graph">' +
     lines + dots + '</svg>' +
     '<h2>Relations</h2>' + table(['from', 'kind', 'to', 'why'], d.edges.map((e) => [
@@ -398,7 +525,7 @@ async function drawContext() {
 
 async function drawEvents() {
   const list = await get('/api/events?limit=200');
-  panel.innerHTML = '<h2>' + list.length + ' most recent events</h2>' +
+  return '<h2>' + list.length + ' most recent events</h2>' +
     table(['time', 'type', 'importance', 'action', 'preview'], list.map((e) => [
       '<span class="mono">' + esc(e.timestamp.slice(11, 19)) + '</span>',
       esc(e.type), impTag(e.importance),
@@ -409,7 +536,7 @@ async function drawEvents() {
 
 async function drawPatches() {
   const list = await get('/api/patches');
-  panel.innerHTML = '<h2>Patch log</h2>' +
+  return '<h2>Patch log</h2>' +
     table(['version', 'origin', 'operations', 'note'], list.map((p) => [
       'v' + p.base_version + ' &rarr; v' + p.new_version,
       esc(p.origin),
@@ -430,13 +557,51 @@ const DRAW = {
   graph: drawGraph, context: drawContext, events: drawEvents, patches: drawPatches,
 };
 
-async function draw() {
-  panel.innerHTML = '<div class="empty">loading…</div>';
+/*
+ * Tabs return their markup rather than writing it, so a refresh can compare before touching the
+ * DOM. Rewriting the panel every few seconds collapsed it to "loading…" and back: the page jumped
+ * to the top, open <details> shut, and a tooltip vanished under the pointer. The Context tab is
+ * the exception - it owns an input and paints itself, and the timer leaves it alone.
+ */
+let painted = null;
+let drawSeq = 0;
+let inFlight = false;
+
+function paint(out) {
+  const view = typeof out === 'string' ? { html: out } : out;
+  if (view.html === painted) return;
+  const open = [...panel.querySelectorAll('details')].map((d) => d.open);
+  panel.innerHTML = view.html;
+  painted = view.html;
+  panel.querySelectorAll('details').forEach((d, i) => { if (open[i]) d.open = true; });
+  if (view.after) view.after();
+}
+
+async function draw(refresh = false) {
+  const seq = ++drawSeq;
+  const tab = current;
+  if (!refresh) {
+    panel.innerHTML = '<div class="empty">loading…</div>';
+    painted = null;
+  }
+  inFlight = true;
   try {
-    await (DRAW[current] || drawBenefits)();
+    const out = await (DRAW[tab] || drawBenefits)();
+    // A tab switch started a newer draw while this one was fetching; the panel is its now.
+    if (seq !== drawSeq) return;
+    if (out != null) paint(out);
     document.getElementById('freshness').textContent = 'updated ' + new Date().toLocaleTimeString();
   } catch (err) {
-    panel.innerHTML = '<div class="empty">' + esc(err.message) + '</div>';
+    if (seq !== drawSeq) return;
+    // A failed background refresh keeps what is on screen; only say so in the header.
+    if (refresh) {
+      document.getElementById('freshness').textContent = 'refresh failed: ' + err.message;
+    } else {
+      panel.innerHTML = '<div class="empty">' + esc(err.message) + '</div>';
+      painted = null;
+    }
+  } finally {
+    if (seq === drawSeq) inFlight = false;
   }
 }
 
@@ -457,7 +622,8 @@ window.addEventListener('hashchange', () => {
 renderTabs();
 draw();
 // The store changes underneath us as the agent works, so refresh on a slow timer.
-setInterval(() => { if (current !== 'context') draw(); }, 5000);
+// Skipped while a draw is still out, so a slow server cannot stack requests up.
+setInterval(() => { if (current !== 'context' && !inFlight) draw(true); }, 5000);
 </script>
 </body>
 </html>`;

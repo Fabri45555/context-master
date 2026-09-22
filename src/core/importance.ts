@@ -85,6 +85,34 @@ const ERROR_CUES = [
 ];
 
 /** Output that means "it worked and there is nothing more to know" (PRD 17 ephemeral). */
+/**
+ * Commands whose success is itself an outcome: work was recorded, shared or released.
+ *
+ * Successful commands are otherwise tool traffic and closed as inert, which is right for `ls` and
+ * wrong for `git commit`: a commit made in another session left "Commit project repository:
+ * blocked" as the current task indefinitely, because no worker ever saw it happen. This is a class
+ * of command, not one command - the outcome of a task is often a shell exit code and nothing else.
+ */
+const MILESTONE_COMMAND =
+  /(?:^|&&|\|\||;|\n)\s*(?:git\s+(?:-C\s+\S+\s+)?(?:commit|push|merge|tag|rebase)\b|gh\s+(?:pr\s+(?:create|merge)|release\s+create)\b|(?:npm|pnpm|yarn|cargo|poetry)\s+publish\b|twine\s+upload\b)/;
+
+/** `--dry-run` changes nothing, so it finishes nothing either. */
+const DRY_RUN = /\s--dry-run\b/;
+
+export function isMilestoneCommand(command: string | undefined | null): boolean {
+  if (!command) return false;
+  return MILESTONE_COMMAND.test(command) && !DRY_RUN.test(command);
+}
+
+/** A milestone that exited 0 - the only kind that says something was finished. */
+export function isSuccessfulMilestone(event: ContextEvent): boolean {
+  return (
+    event.type === 'COMMAND_EXECUTED' &&
+    event.payload.exit_code === 0 &&
+    isMilestoneCommand(event.payload.command)
+  );
+}
+
 const BENIGN_OUTPUT = /^\s*(ok|done|success|passed|no changes|nothing to commit|up to date|\d+ passed[^\n]*)\s*$/i;
 
 export function matchesAny(text: string, patterns: RegExp[]): boolean {
@@ -167,6 +195,8 @@ export function classifyImportance(event: ContextEvent): Importance {
     case 'COMMAND_EXECUTED': {
       const code = event.payload.exit_code;
       if (typeof code === 'number' && code !== 0) return 'high';
+      // "nothing to commit" would otherwise match BENIGN_OUTPUT and be discarded as ephemeral.
+      if (isSuccessfulMilestone(event)) return 'high';
       if (looksLikeError(text)) return 'high';
       return BENIGN_OUTPUT.test(event.payload.output ?? '') ? 'ephemeral' : 'low';
     }
@@ -216,6 +246,9 @@ export function needsSemantics(event: ContextEvent): boolean {
     case 'TASK_STARTED':
     case 'TASK_COMPLETED':
       return true;
+    case 'COMMAND_EXECUTED':
+      // The worker is the one that can say which task or goal the milestone finished.
+      return isSuccessfulMilestone(event);
     default:
       return false;
   }

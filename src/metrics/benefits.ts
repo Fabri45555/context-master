@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Config } from '../core/config.js';
 import type { ContextStore } from '../store/store.js';
 import type { Metrics } from './index.js';
@@ -27,10 +29,21 @@ export interface Benefits {
     query: number;
     empty: number;
     tokens_served: number;
-    /** Tokens not re-read: per delivery, the agent's peak minus what was served. Upper bound. */
+    /**
+     * Times an agent started from memory: a new session, or the same one after a compaction.
+     * Bootstrap deliveries within RESUME_WINDOW_MS of each other are one resume (the hook and
+     * `memory_bootstrap` both serve it).
+     */
+    resumes: number;
+    /** What re-orienting from the project's own documents would cost, per resume. */
+    rebuild_tokens: number;
+    rebuild_source: 'config' | 'documents';
+    /** Per resume, rebuild_tokens minus what the bootstrap cost. */
     tokens_avoided: number;
     /** tokens_avoided priced at the configured agent rate; null when no rate is configured. */
     usd_avoided: number | null;
+    /** Worker spend as recorded (0 for an unpriced tier), so the page can show the net. */
+    worker_usd: number;
   };
   /** Deterministic first (invariant 1): how much work never reached a model at all. */
   triage: {
@@ -68,7 +81,12 @@ export interface Benefits {
   caveats: string[];
 }
 
-export function collectBenefits(store: ContextStore, config: Config, m: Metrics): Benefits {
+export function collectBenefits(
+  store: ContextStore,
+  config: Config,
+  m: Metrics,
+  projectRoot: string | null = null,
+): Benefits {
   const db = store.db;
   const one = <T>(sql: string): T => db.prepare(sql).get() as T;
 
@@ -79,16 +97,19 @@ export function collectBenefits(store: ContextStore, config: Config, m: Metrics)
             COALESCE(SUM(tokens), 0) t
      FROM retrieval_log`,
   );
-  const perDelivery = db
-    // An empty retrieval served nothing, so it cannot have saved anything either.
-    .prepare(`SELECT tokens FROM retrieval_log WHERE item_ids <> '[]'`)
-    .all() as Array<{ tokens: number }>;
+  const bootstraps = db
+    .prepare(`SELECT at, session_id, tokens FROM retrieval_log WHERE query = '(bootstrap)' AND item_ids <> '[]' ORDER BY at`)
+    .all() as Array<{ at: string; session_id: string | null; tokens: number }>;
+  const resumes = countResumes(bootstraps);
 
   const peak = m.agent.peak_input_tokens;
-  // The baseline is the context the agent was really carrying, not the raw history: nobody
-  // replays 200k tokens of transcript to resume, but a session that loses its memory does pay
-  // to rebuild what it held. It is an upper bound and the page says so.
-  const tokensAvoided = peak > 0 ? perDelivery.reduce((s, r) => s + Math.max(0, peak - r.tokens), 0) : 0;
+  // The first version compared every delivery with the agent's 519k peak and printed 1.0M tokens
+  // saved. Nobody re-reads a whole transcript to resume, and a query inside a session that already
+  // holds its context avoids nothing. What a resume without memory really costs is re-reading the
+  // project's documents - and even that does not recover what the user asked for, which the
+  // documents do not contain. So: count resumes only, and price them against the documents.
+  const rebuild = rebuildBaseline(config, projectRoot);
+  const tokensAvoided = resumes * Math.max(0, rebuild.tokens - m.context.active_tokens);
   const rate = config.accounting.agent_input_cost_per_mtok;
 
   const notes = one<{ prov: number; inert: number }>(
@@ -124,8 +145,12 @@ export function collectBenefits(store: ContextStore, config: Config, m: Metrics)
       query: delivery.n - delivery.b,
       empty: delivery.e,
       tokens_served: delivery.t,
+      resumes,
+      rebuild_tokens: rebuild.tokens,
+      rebuild_source: rebuild.source,
       tokens_avoided: tokensAvoided,
       usd_avoided: rate != null ? (tokensAvoided / 1_000_000) * rate : null,
+      worker_usd: m.workers.cost_usd,
     },
     triage: {
       events: m.events.total,
@@ -164,15 +189,55 @@ export function collectBenefits(store: ContextStore, config: Config, m: Metrics)
   return b;
 }
 
+/** Bootstrap deliveries this close together are one resume, served twice (hook and MCP). */
+const RESUME_WINDOW_MS = 10 * 60_000;
+
+export function countResumes(rows: Array<{ at: string; session_id: string | null }>): number {
+  let resumes = 0;
+  let last: number | null = null;
+  for (const r of rows) {
+    const t = Date.parse(r.at);
+    // Session ids are not compared: the MCP call carried none until recently, and a compaction
+    // resumes the *same* session id. Time is what separates two resumes.
+    if (last == null || t - last > RESUME_WINDOW_MS) resumes += 1;
+    last = t;
+  }
+  return resumes;
+}
+
+/**
+ * What re-orienting without memory would cost: reading the project's markdown documents.
+ *
+ * Measured, not guessed: the root and `docs/` .md files, minus the instructions file the agent
+ * loads every session regardless. `accounting.rebuild_baseline_tokens` overrides it for a project
+ * whose documentation is not where its context lives.
+ */
+function rebuildBaseline(config: Config, root: string | null): { tokens: number; source: 'config' | 'documents' } {
+  const configured = config.accounting.rebuild_baseline_tokens;
+  if (configured != null) return { tokens: configured, source: 'config' };
+  if (!root) return { tokens: 0, source: 'documents' };
+  const ALWAYS_LOADED = new Set(['CLAUDE.md', 'AGENTS.md', 'GEMINI.md']);
+  let bytes = 0;
+  for (const dir of [root, join(root, 'docs')]) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.md') || ALWAYS_LOADED.has(name)) continue;
+      const path = join(dir, name);
+      if (statSync(path).isFile()) bytes += statSync(path).size;
+    }
+  }
+  return { tokens: Math.ceil(bytes / 4), source: 'documents' };
+}
+
 /** The counterweight. Each line names a way the figures above could be read too generously. */
 function caveatsFor(b: Benefits, m: Metrics): string[] {
   const out: string[] = [];
   if (b.delivery.total === 0) {
     out.push('Memory has never been delivered to an agent, so every saving on this page is potential, not realised.');
   }
-  if (b.resume.agent_peak_tokens > 0) {
+  if (b.delivery.resumes > 0) {
     out.push(
-      'Tokens avoided compare each delivery with the largest context the agent reported. That is an upper bound: a session that lost its memory would not necessarily rebuild all of it.',
+      `Savings count only resumes (${b.delivery.resumes}), each against re-reading the project's documents (${b.delivery.rebuild_tokens.toLocaleString('en-US')} tokens, ${b.delivery.rebuild_source === 'config' ? 'as configured' : 'measured from the .md files'}). What the user asked for is in none of those documents, so the real alternative to memory is not cheaper - it is incomplete.`,
     );
   }
   if (b.delivery.usd_avoided == null) {

@@ -144,6 +144,36 @@ describe('retrieval accounting', () => {
     }
   });
 
+  it('rebuilds the never_retrieved history so that it ends at the current value', () => {
+    // The dashboard trend is reconstructed from the retrieval log rather than sampled. If the
+    // two ever disagree, the chart is showing a history of some other metric.
+    const { manager, cleanup } = makeManager();
+    try {
+      manager.remember({
+        add: [
+          { id: 'd3', category: 'decisions', text: 'Guard supersede against user-critical items' },
+          { id: 'mem_css', category: 'conventions', text: 'Unrelated styling convention' },
+        ],
+      });
+      const before = manager.store.neverRetrievedHistory();
+      expect(before.at(-1)).toMatchObject({ total: 2, never: 2 });
+
+      manager.queryContext('supersede guard', { record: false });
+      expect(manager.store.neverRetrievedHistory()).toEqual(before);
+
+      manager.queryContext('supersede user critical guard');
+      manager.remember({ add: [{ id: 'mem_late', category: 'goals', text: 'Ship the dashboard trend' }] });
+
+      const history = manager.store.neverRetrievedHistory();
+      const last = history.at(-1)!;
+      expect(last.never / last.total).toBeCloseTo(manager.metrics(null).precision.never_retrieved_ratio, 10);
+      expect(last.never).toBeLessThan(last.total);
+      expect(history.map((p) => p.at)).toEqual([...history.map((p) => p.at)].sort());
+    } finally {
+      cleanup();
+    }
+  });
+
   it('does not credit an item the budget dropped', () => {
     // Only what was rendered counts as retrieved; an item squeezed out was never shown.
     const { manager, cleanup } = makeManager({
@@ -183,17 +213,40 @@ describe('benefits', () => {
       expect(b.caveats.join(' ')).toMatch(/never been delivered/);
       expect(b.triage.handled_by_code).toBeGreaterThan(0);
 
+      const { writeFileSync, mkdirSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      mkdirSync(join(manager.projectRoot, 'docs'), { recursive: true });
+      writeFileSync(join(manager.projectRoot, 'README.md'), 'x'.repeat(40_000));
+      writeFileSync(join(manager.projectRoot, 'docs', 'design.md'), 'x'.repeat(20_000));
+      // Loaded every session regardless, so re-reading it is not something memory avoids.
+      writeFileSync(join(manager.projectRoot, 'CLAUDE.md'), 'x'.repeat(100_000));
+
       manager.store.recordAgentUsage('s1', { input_tokens: 50_000 }, 'claude-opus-5');
       manager.serveBootstrap('s1');
-      b = collectBenefits(manager.store, manager.config, manager.metrics(null));
-      expect(b.delivery.bootstrap).toBe(1);
+      manager.serveBootstrap(null); // the same resume, served again over MCP
+      manager.queryContext('writer', { sessionId: 's1' }); // a query inside a session avoids nothing
+      b = collectBenefits(manager.store, manager.config, manager.metrics(null), manager.projectRoot);
+      expect(b.delivery.bootstrap).toBe(2);
+      expect(b.delivery.resumes).toBe(1);
+      expect(b.delivery.rebuild_tokens).toBe(15_000);
+      expect(b.delivery.tokens_avoided).toBe(15_000 - b.resume.bootstrap_tokens);
       expect(b.resume.smaller_by).toBeGreaterThan(1);
-      expect(b.delivery.tokens_avoided).toBeGreaterThan(0);
       // No price was stated, so no dollar figure is made up.
       expect(b.delivery.usd_avoided).toBeNull();
       expect(b.quality.used_share).toBe(1);
     } finally {
       cleanup();
     }
+  });
+
+  it('counts a compaction hours later as a second resume', async () => {
+    const { countResumes } = await import('../src/metrics/benefits.js');
+    expect(
+      countResumes([
+        { at: '2026-09-19T10:00:00Z', session_id: 's1' },
+        { at: '2026-09-19T10:00:30Z', session_id: null },
+        { at: '2026-09-19T13:00:00Z', session_id: 's1' },
+      ]),
+    ).toBe(2);
   });
 });

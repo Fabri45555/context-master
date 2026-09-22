@@ -32,6 +32,7 @@ export const ollamaEmbeddings: EmbeddingProvider = {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: config.model, prompt: text }),
+        signal: AbortSignal.timeout(config.timeout_ms),
       });
       if (!res.ok) throw new Error(`ollama embeddings ${res.status}: ${await res.text()}`);
       const json = (await res.json()) as { embedding?: number[] };
@@ -54,6 +55,7 @@ export const openaiEmbeddings: EmbeddingProvider = {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
       body: JSON.stringify({ model: config.model, input: texts }),
+      signal: AbortSignal.timeout(config.timeout_ms),
     });
     if (!res.ok) throw new Error(`openai embeddings ${res.status}: ${await res.text()}`);
     const json = (await res.json()) as { data?: Array<{ embedding: number[] }> };
@@ -110,10 +112,16 @@ export interface BackfillResult {
 }
 
 export class EmbeddingIndex {
+  /** `provider` overrides the one named in config - how tests run without a network. */
   constructor(
     private store: ContextStore,
     private config: EmbeddingConfig,
+    private providerOverride?: EmbeddingProvider,
   ) {}
+
+  private get provider(): EmbeddingProvider | null {
+    return this.providerOverride ?? getEmbeddingProvider(this.config.provider);
+  }
 
   get enabled(): boolean {
     return this.config.enabled && this.config.provider !== 'none';
@@ -125,30 +133,31 @@ export class EmbeddingIndex {
   }
 
   get isLocal(): boolean {
-    return getEmbeddingProvider(this.config.provider)?.isLocal ?? true;
+    return this.provider?.isLocal ?? true;
   }
 
   get model(): string {
     return this.config.model;
   }
 
-  /** Items whose text has changed, or which were never embedded. */
+  /** Items never embedded, whose text has changed, or embedded by a different model. */
   stale(limit: number): MemoryItem[] {
+    // No LIMIT on the scan: the text hash is computed here, not in SQL, so a bounded scan
+    // stops seeing new items once that many up-to-date ones precede them.
     const rows = this.store.db
       .prepare(
-        `SELECT m.*, e.text_hash AS existing_hash
+        `SELECT m.id, e.text_hash AS existing_hash, e.model AS existing_model
          FROM memory_items m LEFT JOIN memory_embeddings e ON e.item_id = m.id
-         WHERE m.status = 'active'
-         LIMIT ?`,
+         WHERE m.status = 'active'`,
       )
-      .all(limit * 4) as Array<Record<string, unknown>>;
+      .all() as Array<Record<string, unknown>>;
 
     const out: MemoryItem[] = [];
     for (const r of rows) {
       const item = this.store.getItem(String(r.id));
       if (!item) continue;
       const hash = sha256(embeddingText(item));
-      if (r.existing_hash === hash) continue;
+      if (r.existing_hash === hash && r.existing_model === this.config.model) continue;
       out.push(item);
       if (out.length >= limit) break;
     }
@@ -157,7 +166,7 @@ export class EmbeddingIndex {
 
   async backfill(limit?: number): Promise<BackfillResult> {
     if (!this.enabled) return { embedded: 0, skipped: 0, failed: 0, error: 'embeddings disabled' };
-    const provider = getEmbeddingProvider(this.config.provider);
+    const provider = this.provider;
     if (!provider) return { embedded: 0, skipped: 0, failed: 0, error: 'no embedding provider' };
 
     const items = this.stale(limit ?? this.config.batch_size);
@@ -195,7 +204,7 @@ export class EmbeddingIndex {
    */
   async rank(query: string, limit: number): Promise<Array<{ id: string; score: number }>> {
     if (!this.enabled) return [];
-    const provider = getEmbeddingProvider(this.config.provider);
+    const provider = this.provider;
     if (!provider) return [];
 
     let queryVec: Float32Array;
@@ -216,8 +225,8 @@ export class EmbeddingIndex {
       )
       .all(queryVec.length) as Array<{ item_id: string; vec: Buffer }>;
 
-    return rows
-      .map((r) => ({ id: r.item_id, score: cosine(queryVec, unpackVector(r.vec)) }))
+    const scored = rows.map((r) => ({ id: r.item_id, score: cosine(queryVec, unpackVector(r.vec)) }));
+    return standOut(scored, this.config.min_similarity)
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
   }
@@ -227,6 +236,23 @@ export class EmbeddingIndex {
       this.store.db.prepare(`SELECT COUNT(*) n FROM memory_embeddings`).get() as { n: number }
     ).n;
   }
+}
+
+/**
+ * Keep only the similarities that stand out from this query's own distribution.
+ *
+ * The scan is exhaustive, so without a cut every vector is a "semantic hit" and a small memory
+ * returns all of itself for any query - fusion then spends the budget on the unrelated. A fixed
+ * threshold cannot fix that, because unrelated text scores ~0.1 under one model and ~0.45 under
+ * another; one standard deviation above the mean adapts to whichever model is configured.
+ */
+export function standOut<T extends { score: number }>(scored: T[], floor = 0): T[] {
+  if (scored.length === 0) return scored;
+  const mean = scored.reduce((s, x) => s + x.score, 0) / scored.length;
+  const sd = Math.sqrt(scored.reduce((s, x) => s + (x.score - mean) ** 2, 0) / scored.length);
+  const cut = Math.max(floor, mean + sd);
+  // Tolerance: float32 cosine of identical directions can land a hair under the cut it defines.
+  return scored.filter((x) => x.score > 0 && x.score >= cut - 1e-6);
 }
 
 /**

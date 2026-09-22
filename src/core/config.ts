@@ -54,6 +54,13 @@ export const EmbeddingConfigSchema = z.object({
   weight: z.number().min(0).max(1).default(0.5),
   /** Embed at most this many items per backfill batch. */
   batch_size: z.number().int().positive().default(32),
+  /**
+   * Absolute floor on cosine similarity for a semantic hit. 0 leaves only the per-query
+   * relative cut, because each model has its own baseline for unrelated text.
+   */
+  min_similarity: z.number().min(0).max(1).default(0),
+  /** Per request. A hung provider must degrade a query to keyword-only, not stall it. */
+  timeout_ms: z.number().int().positive().default(5000),
 });
 
 export type EmbeddingConfig = z.infer<typeof EmbeddingConfigSchema>;
@@ -121,6 +128,11 @@ export const ConfigSchema = z.object({
   accounting: z
     .object({
       agent_input_cost_per_mtok: z.number().nonnegative().optional(),
+      /**
+       * What re-orienting a session without memory costs, in tokens. Unset: measured from the
+       * project's root and docs/ markdown files.
+       */
+      rebuild_baseline_tokens: z.number().int().nonnegative().optional(),
     })
     .default({}),
 

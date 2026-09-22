@@ -12,12 +12,12 @@ import { detectConflicts, type Conflict } from '../core/conflicts.js';
 import { estimateTokens } from '../core/events.js';
 import type { StatePatch } from '../core/patch.js';
 import { collectMetrics, type Metrics } from '../metrics/index.js';
-import { ContextBuilder, type BuiltContext } from '../retrieval/context-builder.js';
+import { ContextBuilder, type BuiltContext, type QueryOptions } from '../retrieval/context-builder.js';
 import { dbPath, getMeta, openDb, setMeta } from '../store/db.js';
 import { ContextStore } from '../store/store.js';
-import { EmbeddingIndex, type BackfillResult } from '../store/embeddings.js';
+import { EmbeddingIndex, type BackfillResult, type EmbeddingProvider } from '../store/embeddings.js';
 import type { MemoryEdge } from '../core/graph.js';
-import type { MemoryItem } from '../core/state.js';
+import type { MemoryItem, WorkingMemory } from '../core/state.js';
 import { WorkerRunner, type RunOutcome, type RunnerOptions } from '../workers/runner.js';
 import type { Provider } from '../workers/providers/types.js';
 import { IngestPipeline, type IngestStats } from './ingest.js';
@@ -49,6 +49,8 @@ export interface ManagerOptions {
   provider?: Provider;
   /** Extra worker runner options (batch caps, timeouts). */
   runnerOptions?: RunnerOptions;
+  /** Override the embedding provider, for the same reason as `provider`. */
+  embeddingProvider?: EmbeddingProvider;
 }
 
 export class ContextManager {
@@ -60,6 +62,7 @@ export class ContextManager {
   private builder: ContextBuilder;
   private machine = new StateMachine();
   private embeddingIndex: EmbeddingIndex | null = null;
+  private embeddingProvider: EmbeddingProvider | undefined;
 
   constructor(opts: ManagerOptions = {}) {
     this.loaded = loadConfig(opts.cwd ?? process.cwd(), opts.configOverrides ?? {});
@@ -72,6 +75,7 @@ export class ContextManager {
       ...(opts.provider ? { provider: opts.provider } : {}),
     });
     this.builder = new ContextBuilder(this.store, this.config);
+    this.embeddingProvider = opts.embeddingProvider;
   }
 
   get storageDir(): string {
@@ -300,11 +304,17 @@ export class ContextManager {
     return this.builder.serveBootstrap(sessionId);
   }
 
-  queryContext(
-    query: string,
-    opts: { limit?: number; sessionId?: string | null; record?: boolean } = {},
-  ): BuiltContext {
+  /** Keyword-only and synchronous: safe inside the hook latency budget. */
+  queryContext(query: string, opts: QueryOptions = {}): BuiltContext {
     return this.builder.forQuery(query, opts);
+  }
+
+  /**
+   * What an agent's own query should get: keyword plus semantic when embeddings are on, and
+   * exactly `queryContext` when they are off or the provider is down. Never on the hook path.
+   */
+  queryContextHybrid(query: string, opts: QueryOptions = {}): Promise<BuiltContext> {
+    return this.builder.forQueryHybrid(query, this.embeddings, opts);
   }
 
   // ------------------------------------------------------------- maintenance
@@ -323,13 +333,35 @@ export class ContextManager {
     return this.store.commitPatch({ remove: ids, note: `retired: ${reason}` }, 'user', {});
   }
 
+  /**
+   * Set the current task by hand. Working memory was writable only by a worker, and a worker never
+   * sees what closed a task when it happens as a successful shell command (the fold closes those
+   * as inert) - so a finished commit left "Commit project repository: blocked" in every bootstrap.
+   */
+  setTask(working: Partial<Pick<WorkingMemory, 'current_task' | 'task_status' | 'current_state' | 'next_action' | 'current_plan'>>): ReturnType<ContextStore['commitPatch']> {
+    return this.store.commitPatch({ working, note: 'task set by hand' }, 'user', {});
+  }
+
+  /** Mark goals met, requirements satisfied, questions answered or issues resolved. */
+  closeItems(ids: string[], reason: string, evidence: string[] = []): ReturnType<ContextStore['commitPatch']> {
+    return this.store.commitPatch(
+      { close: ids.map((id) => ({ id, reason, evidence })), note: `closed: ${reason}` },
+      'user',
+      {},
+    );
+  }
+
+  reopenItems(ids: string[], reason: string): ReturnType<ContextStore['commitPatch']> {
+    return this.store.commitPatch({ reopen: ids, note: `reopened: ${reason}` }, 'user', {});
+  }
+
   metrics(sessionId: string | null): Metrics {
     return collectMetrics(this.store, this.config, sessionId);
   }
 
   /** Phase 4 - the optional semantic index. Empty and inert unless configured. */
   get embeddings(): EmbeddingIndex {
-    this.embeddingIndex ??= new EmbeddingIndex(this.store, this.config.embeddings);
+    this.embeddingIndex ??= new EmbeddingIndex(this.store, this.config.embeddings, this.embeddingProvider);
     return this.embeddingIndex;
   }
 

@@ -43,6 +43,7 @@ export const PATCH_SHAPE = `The JSON object is a state patch with these optional
              "kind": ${EDGE_KINDS.map((k) => `"${k}"`).join('|')},
              "reason": string|null }],
   "unlink": [{ "from": string, "to": string, "kind": string }],
+  "close": [{ "id": string, "reason": string, "evidence": string[] }],
   "note": string
 }
 

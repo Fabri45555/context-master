@@ -248,6 +248,8 @@ available until you start a new one. That is the single most common surprise.
 | `memory_query` | Retrieve memory relevant to a topic, plus the always-on critical items. Use before starting work on an area instead of re-deriving context. |
 | `memory_remember` | Record a durable fact: a user constraint, a decision and its reason, a discovery, an open question, an important file. |
 | `memory_retire` | Retire items that are wrong, stale, or were never project state. Kept in the patch log with the reason. User-critical items refuse. |
+| `memory_task` | Set the current task, its status and the next action, so the next session does not start from a stale one. |
+| `memory_close` | Mark goals met, requirements satisfied, questions answered or issues resolved. They leave the bootstrap but stay findable, shown as `done` with what closed them. |
 | `memory_explain` | Why an item is held: source, reason, evidence, confidence, validation history. |
 | `memory_link` | Record how two items relate (`governs`, `motivates`, `implemented_by`, `contradicts`, …). |
 | `memory_neighbours` | Follow those relations out from an item. |
@@ -333,6 +335,42 @@ contextd remember "Hook latency has an explicit budget; current values live in c
   --category completed_work --source agent --importance high --supersedes comp1
 ```
 
+### Keeping the current task current
+
+The **Current task** at the top of every bootstrap is working memory, normally written by workers.
+A worker only learns what the events tell it, and some endings are invisible to it — a successful
+`git commit` used to be closed as inert tool traffic. Successful *milestone* commands — commit,
+push, merge, tag, `gh pr create`, publish — are now kept for a worker, which updates the task and
+closes the goals they finish, and the bootstrap lists them under the task until then
+(`- since then: git commit -m … (feat: …), 5m ago`). The bootstrap also says how old the task is and
+whether you have spoken since (`- recorded: 3h ago, 16 user messages since - verify before relying on it`),
+`contextd doctor` warns after five, and you can set it directly:
+
+```bash
+contextd task                                    # show it
+contextd task "Ship the export" --status in_progress --next "write the CSV header test"
+contextd task --status done
+contextd task --clear
+```
+
+An agent does the same with `memory_task`.
+
+### Closing what is finished
+
+A met goal, a satisfied requirement, an answered question or a fixed issue is not wrong — it is
+done. Retiring it would lose history, and a user goal cannot be retired anyway. Close it:
+
+```bash
+contextd close g1 r1 --reason "README written; Benefits tab shipped"
+contextd reopen g1 --reason "README still misses the uninstall section"
+```
+
+A closed item leaves the always-on bootstrap, keeps its protection, and still answers queries as
+`(goal, done) … (closed: <reason>)`. Only goals, requirements, open questions and known issues can
+be closed — a constraint or a decision is never "done". Workers close items too when the events
+show the outcome, but a worker closing a `source: user` + `critical` goal must cite an event that
+exists, or the close is dropped.
+
 `--source agent` is for corrections you did not hear from the user: it keeps the item at confidence
 0.85 and out of the protected class. An agent does the same through `memory_retire` and
 `memory_remember` with `supersedes`. A `source: user` + `critical` item refuses both, whoever asks.
@@ -356,6 +394,9 @@ contextd remember "Hook latency has an explicit budget; current values live in c
 | `context [query]` | Build the context an agent should receive | `--limit`, `--json` |
 | `remember <text>` | Record a constraint or decision by hand | `--category`, `--reason`, `--importance`, `--source user\|agent`, `--supersedes <ids>` |
 | `forget <ids...>` | Retire wrong items; kept in the patch log | `--reason` (required) |
+| `task [text]` | Show or set the current task in working memory | `--status`, `--next`, `--state`, `--plan <steps...>`, `--clear` |
+| `close <ids...>` | Mark goals / requirements / questions / issues as finished | `--reason` (required) |
+| `reopen <ids...>` | Undo a close | `--reason` (required) |
 | `inspect [id]` | Explain an item, or show the patch and event log | `--patches [n]`, `--events [n]`, `--search <q>` |
 | `replay` | Rebuild state from the patch log | `--verify`, `--version <n>` |
 | `compact` | Drain the pending queue through workers now | `--session`, `--task`, `--max-runs` |
@@ -409,7 +450,9 @@ Here is the complete set, with the defaults filled in:
   // What the coding agent's own input tokens cost, for the Benefits view. Unset: savings are
   // shown in tokens only, never priced at a guessed rate.
   "accounting": {
-    // "agent_input_cost_per_mtok": 15
+    // "agent_input_cost_per_mtok": 15,
+    // "rebuild_baseline_tokens": 40000  // what re-orienting without memory costs; unset: measured
+                                         // from the root and docs/ .md files, minus CLAUDE.md
   },
 
   // Cost control. When exceeded, workers stop; deterministic maintenance continues.
@@ -448,7 +491,9 @@ Here is the complete set, with the defaults filled in:
     "provider": "ollama",       // "ollama" | "openai" | "none"
     "model": "nomic-embed-text",
     "weight": 0.5,              // weight of the semantic ranking in the fusion; 0 disables at query time
-    "batch_size": 32
+    "batch_size": 32,
+    "min_similarity": 0,        // absolute floor on cosine; the per-query relative cut applies regardless
+    "timeout_ms": 5000          // per provider request; on timeout the query answers keyword-only
   },
 
   // Context is a budget, not a bucket.
@@ -607,8 +652,8 @@ figure with the baseline it is measured against:
 
 | Figure | Measured as |
 |---|---|
-| **N× smaller** | the bootstrap a new session starts from vs the largest context the agent actually reported |
-| **Tokens not re-read** | per non-empty delivery of memory, agent peak minus what was served — an upper bound, and labelled so |
+| **N× smaller** | the size of the project state vs the conversation it was distilled from — a size comparison, not a saving |
+| **Saved** | per **resume** (a new session, or the same one after a compaction), the project's `.md` documents an agent would re-read to reorient, minus the bootstrap. Queries inside a session count for nothing: that session already holds its context |
 | **Settled by code** | events discarded at ingest or closed by the deterministic fold: they never reached a model |
 | **Protected instructions** | active `source: user` + `critical` items, enforced by `isProtected` |
 | **From events to memory** | the funnel: observed → settled by code → read by a worker → still waiting → items |
@@ -671,12 +716,20 @@ it on if you want it:
 ```
 
 ```bash
-contextd embed --all      # build or refresh the index
+contextd embed --all      # build the index up front (optional)
 ```
 
+Once on, `memory_query`, `contextd context <query>` and the dashboard's Context tab all fuse the
+semantic ranking in, and each query first embeds any item that is new or has changed, so the index
+never needs a manual refresh. The hooks never do: embedding a query is a provider call, and the hook
+path has a latency budget, so what hooks inject stays keyword-only.
+
 Rankings are fused by reciprocal rank rather than by adding scores, because BM25 and cosine are not
-on a comparable scale. If the embedding provider is down, retrieval falls back to keywords instead
-of failing.
+on a comparable scale. The cosine scan covers every vector, so only similarities that stand out from
+that query's own distribution (above mean + one standard deviation) count as semantic hits — a
+fixed threshold would be wrong for some model, since unrelated text scores ~0.1 under one and ~0.45
+under another. If the provider is down or slow, the query answers keyword-only instead of failing
+or waiting.
 
 **Contradictions.** Detection is deterministic and free — trigram similarity plus polarity — and
 deliberately crosses category boundaries, because a user constraint contradicted by an agent
@@ -732,6 +785,7 @@ routed provider, the budget, hook latency, the patch log and the compaction ladd
 | Memory full of the agent's own fumbling | Should be filtered; if it is not, that is a gap | See `isTransientToolError`, and open an issue with the text |
 | A wrong item needs removing | — | `contextd forget <id> --reason "…"`, or `remember … --supersedes <id>` to replace it |
 | A wrong item cannot be deleted | It is `source: user` + `critical`, protected by design | `reset` and re-import without that patch; the protection is deliberate |
+| Bootstrap shows a task that finished long ago | Its ending was invisible to workers (e.g. a commit) | `contextd task "…" --status …`; `doctor` flags it after 5 user messages |
 | Occupancy never changes between turns | The `Stop` hook is missing or predates this version | Re-run `contextd init`; occupancy is read from the transcript on `Stop` |
 | Memory repeats itself after you paste `contextd memory` output | Older version | Verbatim re-adds are now dropped as no-ops; `forget` the copies |
 

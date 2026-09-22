@@ -1,6 +1,6 @@
 import type { StoredEvent } from '../store/store.js';
 import type { StatePatch, AddItem } from './patch.js';
-import { looksLikeError } from './importance.js';
+import { isSuccessfulMilestone, looksLikeError } from './importance.js';
 import { isSensitivePath } from './redact.js';
 
 /**
@@ -165,6 +165,10 @@ export function deterministicFold(events: StoredEvent[]): FoldResult {
           });
           consumed.push(e.id);
           notes.push('command_failed');
+        } else if (isSuccessfulMilestone(e)) {
+          // Left pending for a worker: it can tell which task or goal this finished, and the
+          // bootstrap reports it against the recorded task in the meantime.
+          notes.push('milestone');
         } else if (typeof code === 'number') {
           // Succeeded with nothing else derivable: the event has served its purpose.
           if (!looksLikeError(firstString(e.payload.output) ?? '')) inert.push(e.id);

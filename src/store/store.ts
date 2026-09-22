@@ -8,6 +8,7 @@ import {
 } from '../core/events.js';
 import {
   applyPatch,
+  isProtected,
   MAX_INFERRED_CONFIDENCE,
   normalizePatch,
   pruneInertOperations,
@@ -25,7 +26,8 @@ import {
 } from '../core/state.js';
 import type { UsageRecord } from '../core/budget.js';
 import { MemoryEdgeSchema, isSymmetric, traversalWeight, type MemoryEdge } from '../core/graph.js';
-import { getIntMeta, setMeta, type Db } from './db.js';
+import { getIntMeta, getMeta, setMeta, type Db } from './db.js';
+import { isMilestoneCommand } from '../core/importance.js';
 
 export interface StoredEvent extends ContextEvent {
   action: string;
@@ -376,7 +378,12 @@ export class ContextStore {
   commitPatch(
     rawPatch: StatePatch,
     origin: 'worker' | 'deterministic' | 'user' | 'import',
-    opts: { sessionId?: string | null; workerRunId?: string | null } = {},
+    opts: {
+      sessionId?: string | null;
+      workerRunId?: string | null;
+      /** Timestamp of the newest event the patch was derived from. */
+      observedUntil?: string | null;
+    } = {},
   ): CommitResult {
     // Ids are assigned before the patch is written, so replaying the log rebuilds exactly
     // the same items rather than a fresh set with new ids.
@@ -391,13 +398,32 @@ export class ContextStore {
       const pruned = origin === 'user' ? { patch: normalized, dropped: [] } : pruneInertOperations(normalized, state);
       // Only a worker has to prove provenance: `user` origin is the user, and `import` replays a
       // log that was already checked when it was first written.
-      const checked = origin === 'worker' ? this.verifyUserProvenance(pruned.patch) : { patch: pruned.patch, downgraded: [] };
+      const proven = origin === 'worker' ? this.verifyUserProvenance(pruned.patch) : { patch: pruned.patch, downgraded: [] };
+      const closures = origin === 'worker' ? this.verifyClosures(proven.patch, state) : { patch: proven.patch, refused: [] };
+      // Working memory is one row, and last write wins. A worker reading an older batch rewrote a
+      // task set by hand after those events - "Commit: blocked" came back over the real state. So a
+      // worker may not overwrite a task a person set after everything it read. Keyed on the hand
+      // edit, not on `updated_at`: a worker's own commit stamps "now", which would lock out the
+      // second batch of any backlog.
+      const setByHand = getMeta(this.db, 'working_set_by_hand_at');
+      const staleWorking =
+        origin === 'worker' &&
+        closures.patch.working != null &&
+        opts.observedUntil != null &&
+        setByHand != null &&
+        setByHand > opts.observedUntil;
+      const withWorking = staleWorking ? { ...closures.patch, working: undefined } : closures.patch;
+      const checked = { patch: withWorking, downgraded: proven.downgraded };
       const notes = [
         checked.patch.note,
         pruned.dropped.length > 0 ? `dropped inert: ${pruned.dropped.join(', ')}` : null,
         checked.downgraded.length > 0
           ? `downgraded to agent (no user-message evidence): ${checked.downgraded.join(', ')}`
           : null,
+        closures.refused.length > 0
+          ? `close refused (user-critical, no event evidence): ${closures.refused.join(', ')}`
+          : null,
+        staleWorking ? 'working dropped: the task was updated after the newest event this patch read' : null,
       ].filter(Boolean);
       const patch = notes.length > 0 ? { ...checked.patch, note: notes.join(' | ') } : checked.patch;
       const violations = validatePatch(patch, state);
@@ -492,6 +518,7 @@ export class ContextStore {
           opts.workerRunId ?? null,
           new Date().toISOString(),
         );
+      if (origin === 'user' && patch.working) setMeta(this.db, 'working_set_by_hand_at', new Date().toISOString());
       setMeta(this.db, 'patch_seq', String(seq));
       setMeta(this.db, 'state_version', String(result.state.version));
 
@@ -685,6 +712,55 @@ export class ContextStore {
       lowConfidence: row.low_confidence ?? 0,
       unverified: row.unverified ?? 0,
     };
+  }
+
+  /**
+   * `never_retrieved` as it stood after each change, rebuilt from the audit trail rather than
+   * sampled: `retrieval_log` is written alongside every `markUsed`, and the ratio counts every
+   * item ever created whatever its status, so creation times plus first retrievals determine
+   * the whole series. Nothing new has to be stored, and history exists from the first item.
+   */
+  neverRetrievedHistory(): Array<{ at: string; total: number; never: number }> {
+    const created = this.db.prepare(`SELECT id, created_at FROM memory_items`).all() as Array<{
+      id: string;
+      created_at: string;
+    }>;
+    const firstUse = new Map(
+      (
+        this.db
+          .prepare(
+            `SELECT j.value AS id, MIN(r.at) AS at FROM retrieval_log r, json_each(r.item_ids) j
+             GROUP BY j.value`,
+          )
+          .all() as Array<{ id: string; at: string }>
+      ).map((r) => [r.id, r.at]),
+    );
+
+    const changes: Array<{ at: string; total: number; never: number }> = [];
+    for (const { id, created_at } of created) {
+      changes.push({ at: created_at, total: 1, never: 1 });
+      const used = firstUse.get(id);
+      // An item cannot be retrieved before it exists; clamp against clock skew between writers.
+      if (used) changes.push({ at: used < created_at ? created_at : used, total: 0, never: -1 });
+    }
+    changes.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+
+    const out: Array<{ at: string; total: number; never: number }> = [];
+    let total = 0;
+    let never = 0;
+    for (const c of changes) {
+      total += c.total;
+      never += c.never;
+      // Changes sharing a timestamp are one step: a patch adds its items at once.
+      const last = out[out.length - 1];
+      if (last && last.at === c.at) {
+        last.total = total;
+        last.never = never;
+      } else {
+        out.push({ at: c.at, total, never });
+      }
+    }
+    return out;
   }
 
   // ------------------------------------------------------------- worker runs
@@ -966,6 +1042,85 @@ export class ContextStore {
     });
 
     return downgraded.length > 0 ? { patch: { ...patch, add }, downgraded } : { patch, downgraded };
+  }
+
+  /**
+   * A worker may declare a user's goal met only by citing something that happened.
+   *
+   * Closing does not delete, but it does take the goal out of every session start, which is most
+   * of what deleting it would do. So the same rule as provenance: the claim needs evidence that
+   * exists. A close that cannot show any is dropped, not the whole patch.
+   */
+  private verifyClosures(patch: StatePatch, state: ProjectState): { patch: StatePatch; refused: string[] } {
+    if (!patch.close?.length) return { patch, refused: [] };
+    const byId = new Map(state.items.map((i) => [i.id, i]));
+    const cited = [...new Set(patch.close.flatMap((c) => c.evidence ?? []))];
+    const real = new Set<string>();
+    if (cited.length > 0) {
+      const rows = this.db
+        .prepare(`SELECT id FROM events WHERE id IN (${cited.map(() => '?').join(',')})`)
+        .all(...cited) as Array<{ id: string }>;
+      for (const r of rows) real.add(r.id);
+    }
+    const refused: string[] = [];
+    const close = patch.close.filter((c) => {
+      const target = byId.get(c.id);
+      if (!target || !isProtected(target)) return true;
+      if ((c.evidence ?? []).some((id) => real.has(id))) return true;
+      refused.push(c.id);
+      return false;
+    });
+    return refused.length > 0 ? { patch: { ...patch, close }, refused } : { patch, refused };
+  }
+
+  /**
+   * Successful milestone commands (commit, push, merge, publish...) after `iso`, newest first.
+   * Filtered in code rather than SQL so the definition lives in one place: `isMilestoneCommand`.
+   */
+  milestonesSince(iso: string | null, limit = 50): Array<{ command: string; summary: string | null; at: string }> {
+    const rows = (
+      iso
+        ? this.db
+            .prepare(`SELECT ts, payload FROM events WHERE type = 'COMMAND_EXECUTED' AND ts > ? ORDER BY ts DESC LIMIT 500`)
+            .all(iso)
+        : this.db.prepare(`SELECT ts, payload FROM events WHERE type = 'COMMAND_EXECUTED' ORDER BY ts DESC LIMIT 500`).all()
+    ) as Array<{ ts: string; payload: string }>;
+    const out: Array<{ command: string; summary: string | null; at: string }> = [];
+    for (const r of rows) {
+      const p = JSON.parse(r.payload) as { command?: string; exit_code?: number; output?: string };
+      if (p.exit_code !== 0 || !isMilestoneCommand(p.command)) continue;
+      // `git commit` prints "[branch abc1234] subject": the one line worth showing.
+      const subject = /^\[[^\]]+\]\s*(.+)$/m.exec(p.output ?? '')?.[1] ?? null;
+      out.push({ command: p.command!, summary: subject, at: r.ts });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  /** How many times the user has spoken since `iso` - the signal that a recorded task has moved on. */
+  userMessagesSince(iso: string | null): number {
+    const row = (
+      iso
+        ? this.db.prepare(`SELECT COUNT(*) n FROM events WHERE type = 'USER_MESSAGE' AND ts > ?`).get(iso)
+        : this.db.prepare(`SELECT COUNT(*) n FROM events WHERE type = 'USER_MESSAGE'`).get()
+    ) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * The session an MCP call most likely belongs to.
+   *
+   * An MCP server is spawned by the agent without being told which session it serves, while the
+   * hooks of that same session are writing events. So the session with the freshest event, if it
+   * is fresh at all, is the caller. An inference, used only to attribute retrievals; null when
+   * nothing is recent, rather than a guess at an idle session.
+   */
+  activeSessionId(withinMs = 30 * 60_000, now = Date.now()): string | null {
+    const row = this.db
+      .prepare(`SELECT session_id, ts FROM events ORDER BY ts DESC LIMIT 1`)
+      .get() as { session_id: string; ts: string } | undefined;
+    if (!row) return null;
+    return now - Date.parse(row.ts) <= withinMs ? row.session_id : null;
   }
 
   logRetrieval(sessionId: string | null, query: string, itemIds: string[], tokens: number): void {

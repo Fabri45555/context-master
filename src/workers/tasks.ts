@@ -90,6 +90,18 @@ distrust.
 Record what the user asked for under "goals", in their own terms. It is the one thing a new
 session cannot reconstruct from the repository.
 
+A successful commit, push, merge, tag or publish is evidence that work was finished. Use it to
+update "working" (the task, its status, the next action) and to close the goals it completes -
+citing the command's event id. Do not add it as its own memory item: it is a changelog line, and
+the repository already records it.
+
+When the events show that an existing goal was met, a requirement satisfied, an open question
+answered or a known issue fixed, "close" it: say what closed it and cite the event ids that show
+it. Do not remove it and do not supersede it - a finished goal is history worth finding, it just
+stops being orientation. Close only on evidence of the outcome, never on the agent saying it will
+do something. Items that are not goals, requirements, open questions or known issues cannot be
+closed.
+
 A question the user asks the agent is not an "open_questions" item. Open questions are what the
 project has not decided yet; a question put to the agent is answered in the session.
 

@@ -280,6 +280,21 @@ function integrityChecks(manager: ContextManager): Check[] {
     });
   }
 
+  const working = manager.store.workingMemory();
+  if (working.current_task) {
+    const since = manager.store.userMessagesSince(working.updated_at);
+    out.push({
+      name: 'current task',
+      status: since >= STALE_TASK_USER_MESSAGES ? 'warn' : 'ok',
+      detail:
+        `"${working.current_task.slice(0, 60)}" (${working.task_status})` +
+        (since > 0 ? `, ${since} user message${since === 1 ? '' : 's'} since it was recorded` : ''),
+      ...(since >= STALE_TASK_USER_MESSAGES
+        ? { fix: 'run `contextd compact`, or set it: `contextd task "<task>" --status in_progress`' }
+        : {}),
+    });
+  }
+
   const pending = manager.store.pendingSummary(null);
   if (pending.count > 0) {
     out.push({
@@ -291,6 +306,9 @@ function integrityChecks(manager: ContextManager): Check[] {
   }
   return out;
 }
+
+/** The user has moved on this many times without the task changing: it is probably not current. */
+const STALE_TASK_USER_MESSAGES = 5;
 
 function describeAge(mtime: number): string {
   const mins = Math.round((Date.now() - mtime) / 60_000);

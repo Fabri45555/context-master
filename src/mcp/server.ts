@@ -47,7 +47,7 @@ export function buildMcpServer(manager: ContextManager): McpServer {
       inputSchema: {},
     },
     async () => {
-      const built = manager.serveBootstrap();
+      const built = manager.serveBootstrap(manager.store.activeSessionId());
       const text = built.text.length > 0 ? built.text : 'No project memory recorded yet.';
       return {
         content: [{ type: 'text' as const, text: `${text}\n\n(${built.tokens} tokens)` }],
@@ -66,7 +66,10 @@ export function buildMcpServer(manager: ContextManager): McpServer {
       },
     },
     async ({ query, limit }) => {
-      const built = manager.queryContext(query, { limit: limit ?? 12 });
+      const built = await manager.queryContextHybrid(query, {
+        limit: limit ?? 12,
+        sessionId: manager.store.activeSessionId(),
+      });
       const text = built.text.length > 0 ? built.text : `No memory matched: ${query}`;
       return { content: [{ type: 'text' as const, text: `${text}\n\n(${built.tokens} tokens)` }] };
     },
@@ -148,6 +151,65 @@ export function buildMcpServer(manager: ContextManager): McpServer {
         };
       }
       return { content: [{ type: 'text' as const, text: `Retired ${ids.join(', ')} (state v${result.version}).` }] };
+    },
+  );
+
+  server.registerTool(
+    'memory_task',
+    {
+      description:
+        'Set the current task in working memory: what is being done, its status, and the next action. Call it when the task changes or finishes, so the next session does not start from a stale one.',
+      inputSchema: {
+        task: z.string().optional().describe('The current task, in one line.'),
+        status: z.enum(['unknown', 'planning', 'in_progress', 'blocked', 'review', 'done']).optional(),
+        next_action: z.string().optional().describe('The next concrete step.'),
+        state: z.string().optional().describe('Where things stand.'),
+      },
+    },
+    async ({ task, status, next_action, state }) => {
+      if (task == null && status == null && next_action == null && state == null) {
+        return { isError: true, content: [{ type: 'text' as const, text: 'Nothing to set: pass task, status, next_action or state.' }] };
+      }
+      const result = manager.setTask({
+        ...(task != null ? { current_task: task } : {}),
+        ...(status != null ? { task_status: status } : {}),
+        ...(next_action != null ? { next_action } : {}),
+        ...(state != null ? { current_state: state } : {}),
+      });
+      if (!result.ok) {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: `Rejected: ${result.violations.map((v) => v.message).join('; ')}` }],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: `Task updated (state v${result.version}).` }] };
+    },
+  );
+
+  server.registerTool(
+    'memory_close',
+    {
+      description:
+        'Mark goals as met, requirements as satisfied, open questions as answered or known issues as resolved. The items stay in memory and findable by query, but leave the always-on bootstrap. Use when the work is verifiably done; say what closed it.',
+      inputSchema: {
+        ids: z.array(z.string()).min(1).describe('Ids of the items to close.'),
+        reason: z.string().min(1).describe('What closed them, e.g. "README.md written, 771 lines".'),
+      },
+    },
+    async ({ ids, reason }) => {
+      const result = manager.closeItems(ids, reason);
+      if (!result.ok) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Rejected: ${result.violations.map((v) => `${v.code} ${v.message}`).join('; ')}`,
+            },
+          ],
+        };
+      }
+      return { content: [{ type: 'text' as const, text: `Closed ${ids.join(', ')} (state v${result.version}).` }] };
     },
   );
 

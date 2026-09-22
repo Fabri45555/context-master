@@ -412,6 +412,13 @@ export function inferExitCode(response: unknown, output: string): number | undef
     if (typeof o.interrupted === 'boolean' && o.interrupted) return 130;
   }
   if (/^\s*(command failed|error:)/i.test(output)) return 1;
+  // Claude's Bash reports success as `{stdout, stderr, interrupted: false}` with no exit code at
+  // all; a failure arrives as an error instead. Leaving that undefined made every successful
+  // command unknowable, so a `git commit` could never count as having happened.
+  if (response && typeof response === 'object') {
+    const o = response as Record<string, unknown>;
+    if ('stdout' in o && o.interrupted === false) return 0;
+  }
   return undefined;
 }
 
