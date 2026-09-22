@@ -236,7 +236,10 @@ function mcpChecks(host: HostEnv, wiring: Wiring): Check[] {
       } else if (reg.elsewhere.some((e) => !e.managed)) {
         out.push({ name, status: 'warn', detail: `a "${MCP_SERVER_NAME}" entry contextd did not write is in the way`, fix: 'inspect it with `contextd mcp status`' });
       } else if (used) {
-        out.push({ name, status: 'warn', detail: `not registered; ${adapter.agent} cannot query memory`, fix });
+        // For an agent contextd cannot observe, "used" only means its config dir exists on this
+        // machine - not that anyone runs it in this project. A warning there would keep the
+        // dashboard's health pill amber for every editor someone merely has installed.
+        out.push({ name, status: ingests(adapter) ? 'warn' : 'skip', detail: `not registered; ${adapter.agent} cannot query memory`, fix });
       } else {
         out.push({ name, status: 'skip', detail: `${adapter.agent} not used in this project` });
       }

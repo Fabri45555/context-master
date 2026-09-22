@@ -266,7 +266,7 @@ describe('agents contextd serves but cannot observe', () => {
 
       mkdirSync(join(env.home, '.cursor'));
       const checks = diagnose(manager, { host: env, checkoutRoot: null });
-      expect(checks.find((c) => c.name === 'cursor: mcp')).toMatchObject({ status: 'warn' });
+      expect(checks.find((c) => c.name === 'cursor: mcp')).toMatchObject({ status: 'skip' });
       expect(checks.find((c) => c.name === 'cursor: mcp')?.fix).toContain('--adapter cursor');
       expect(checks.find((c) => c.name === 'cursor: ingestion')).toMatchObject({ status: 'skip' });
       expect(checks.find((c) => c.name === 'cursor: transcript')).toBeUndefined();
