@@ -34,11 +34,13 @@ import { applyNativeImport, planNativeImport } from '../ops/import-native.js';
 import { formatOverview, summarizeProject } from '../ops/overview.js';
 import { createInterface } from 'node:readline/promises';
 import { isProtected, StatePatchSchema } from '../core/patch.js';
-import { CONFIG_FILENAMES, findConfigFile, type WorkerTask } from '../core/config.js';
+import { CONFIG_FILENAMES, findConfigFile, ModelTierSchema, type WorkerTask } from '../core/config.js';
 import { ContextManager } from '../daemon/manager.js';
 import { formatMetrics, formatPressure } from '../metrics/index.js';
 import { benchmark, formatBench } from '../bench/index.js';
 import { evaluateRetrieval, formatRetrievalEval } from '../bench/retrieval-eval.js';
+import { formatJudgeReport, judgeRetrieval, JudgeRefused } from '../bench/retrieval-judge.js';
+import { getProvider } from '../workers/providers/index.js';
 import { runMcpStdio, similarHint } from '../mcp/server.js';
 import { startUi } from '../ui/server.js';
 import { RetrievalEngine } from '../store/retrieval.js';
@@ -599,7 +601,7 @@ program
   .command('compact')
   .description('drain the pending event queue through workers now')
   .option('--session <id>', 'limit to one session')
-  .option('--task <name>', 'worker task (extraction|summarization|conflict_resolution|complex_reconciliation)', 'extraction')
+  .option('--task <name>', 'worker task (extraction|summarization|conflict_resolution|complex_reconciliation; learn has its own command)', 'extraction')
   .option('--max-runs <n>', 'maximum worker runs', '10')
   .action(async (opts, cmd) => {
     const m = manager(cmd);
@@ -653,6 +655,58 @@ program
         return;
       }
       for (const p of performed) out(`${p.action.padEnd(18)} ${p.detail}`);
+    } finally {
+      m.close();
+    }
+  });
+
+// ------------------------------------------------------------------ learn
+
+program
+  .command('learn')
+  .description('turn failure -> success episodes into lessons (one model call per session with an episode)')
+  .option('--session <id>', 'learn from this session (default: the most recent one)')
+  .option('--all', 'every session with new episodes', false)
+  .option('--dry-run', 'print the digests that would be sent; call no model, write nothing', false)
+  .action(async (opts, cmd) => {
+    const m = manager(cmd);
+    try {
+      const results = await m.learn({
+        sessionId: (opts.session as string) ?? null,
+        all: opts.all === true,
+        dryRun: opts.dryRun === true,
+      });
+      const withEpisodes = results.filter((r) => r.input != null);
+      if (withEpisodes.length === 0) {
+        out('no new failure -> success episodes; no model was called');
+        return;
+      }
+      let cost = 0;
+      let tokens = 0;
+      for (const r of withEpisodes) {
+        const d = r.input!.digest;
+        const omitted = d.omitted > 0 ? `, ${d.omitted} left for the next run` : '';
+        out(`session ${r.sessionId}: ${d.episodes.length} episodes, ~${d.tokens} digest tokens${omitted}`);
+        if (opts.dryRun) {
+          out('');
+          out(d.text);
+          out('');
+          continue;
+        }
+        const o = r.outcome!;
+        cost += o.costUsd;
+        tokens += o.usage ? o.usage.input_tokens + o.usage.output_tokens : 0;
+        out(`  ${o.status.padEnd(9)} ${o.reason}  v${o.version}`);
+        for (const v of o.violations) out(`    ${v.code}: ${v.message}`);
+        if (o.patchId) {
+          const learned = m.store
+            .allItems()
+            .filter((i) => i.tags.includes('learned') && i.evidence.some((id) => d.evidenceIds.has(id)));
+          for (const i of learned) out(`    + ${i.id} [${i.category}] ${i.text}`);
+        }
+      }
+      if (opts.dryRun) out('dry run: no model called, nothing written');
+      else out(`worker tokens ${tokens}  cost $${cost.toFixed(5)}`);
     } finally {
       m.close();
     }
@@ -1067,6 +1121,9 @@ program
   .option('--real-embeddings', 'with --retrieval: use the configured embedding provider, not the offline stand-in', false)
   .option('--k <n>', 'with --retrieval: cutoff for recall@k', '5')
   .option('--verbose', 'with --retrieval: per-query ranks', false)
+  .option('--judge', 'with --retrieval: ask a model whether each served context answers its query (costs calls)', false)
+  .option('--judge-tier <tier>', 'with --judge: which configured model tier judges (cheap|medium|high)', 'cheap')
+  .option('--judge-limit <n>', 'with --judge: judge only the first n queries')
   .option('--json', 'machine-readable output', false)
   .action(async (opts, cmd) => {
     const m = manager(cmd);
@@ -1083,7 +1140,35 @@ program
           k: Number(opts.k),
           ...(provider ? { provider, embeddings: m.config.embeddings } : {}),
         });
-        out(opts.json ? JSON.stringify(e, null, 2) : formatRetrievalEval(e, opts.verbose === true));
+        if (opts.judge !== true) {
+          out(opts.json ? JSON.stringify(e, null, 2) : formatRetrievalEval(e, opts.verbose === true));
+          return;
+        }
+        const tier = ModelTierSchema.parse(opts.judgeTier);
+        const spec = m.config.models.tiers[tier];
+        if (!spec) throw new Error(`no model configured for tier ${tier}`);
+        try {
+          const report = await judgeRetrieval(e, {
+            provider: getProvider(spec.provider),
+            spec,
+            localOnly: m.config.privacy.local_only,
+            timeoutMs: m.config.limits.worker_timeout_ms,
+            ...(opts.judgeLimit != null ? { limit: Number(opts.judgeLimit) } : {}),
+          });
+          if (opts.json) {
+            out(JSON.stringify({ ...e, judge: report }, null, 2));
+          } else {
+            out(formatRetrievalEval(e, opts.verbose === true));
+            out('');
+            out(formatJudgeReport(report, opts.verbose === true));
+          }
+        } catch (err) {
+          if (!(err instanceof JudgeRefused)) throw err;
+          out(formatRetrievalEval(e, opts.verbose === true));
+          out('');
+          out(`--judge: ${err.message}`);
+          process.exitCode = 1;
+        }
         return;
       }
       const b = benchmark(m, (opts.session as string) ?? null);

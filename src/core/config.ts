@@ -13,6 +13,8 @@ export const WORKER_TASKS = [
   'summarization',
   'conflict_resolution',
   'complex_reconciliation',
+  /** Lessons from a session's failure -> success episodes. Never on the hook path. */
+  'learn',
 ] as const;
 export const WorkerTaskSchema = z.enum(WORKER_TASKS);
 export type WorkerTask = z.infer<typeof WorkerTaskSchema>;
@@ -186,6 +188,9 @@ export const ConfigSchema = z.object({
           summarization: 'cheap',
           conflict_resolution: 'medium',
           complex_reconciliation: 'high',
+          // Reads a small digest, but judging whether an episode is a lesson or ordinary
+          // development is the whole job, and the cheap tier writes changelog lines instead.
+          learn: 'medium',
         }),
     })
     .default({}),
@@ -207,6 +212,21 @@ export const ConfigSchema = z.object({
        * contextd should not start editing a file the user reads because a hook fired.
        */
       refresh_on_maintenance: z.boolean().default(false),
+    })
+    .default({}),
+
+  /**
+   * The `learn` worker task (`contextd learn`). Off the lifecycle by default: it spends a model
+   * call per session with an episode, and only a person should opt into that happening unasked.
+   */
+  learn: z
+    .object({
+      /** Also run it in `lifecycle --act` at the consolidate rung and above. */
+      in_lifecycle: z.boolean().default(false),
+      /** Episodes per digest; the rest wait for the next run. */
+      max_episodes: z.number().int().positive().default(12),
+      /** Estimated tokens per digest, cut at an episode boundary. */
+      max_digest_tokens: z.number().int().positive().default(3000),
     })
     .default({}),
 
