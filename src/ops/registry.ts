@@ -70,3 +70,28 @@ export function unregisterProject(path: string, root: string): boolean {
     return false;
   }
 }
+
+/**
+ * Keep only the entries `keep` accepts; returns the ones dropped. The file is rewritten only when
+ * something changed, and a failure to write reports nothing dropped rather than throwing.
+ */
+export function filterRegistry(path: string, keep: (e: RegistryEntry) => boolean): RegistryEntry[] {
+  try {
+    const entries = readRegistry(path);
+    const kept = entries.filter(keep);
+    if (kept.length === entries.length) return [];
+    write(path, kept);
+    return entries.filter((e) => !kept.includes(e));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Whether an entry still points at a project with memory. Cheap on purpose - two stats, no
+ * database open - because `projects prune` runs over every entry. A project whose config moved
+ * its storage looks gone here; its next session registers it again with the new location.
+ */
+export function entryIsLive(e: RegistryEntry, dbFile: (storageDir: string) => string): boolean {
+  return existsSync(e.root) && existsSync(dbFile(e.storage_dir));
+}

@@ -59,7 +59,9 @@ export function summarizeProject(entry: RegistryEntry): ProjectSummary {
 }
 
 export function formatOverview(rows: readonly ProjectSummary[], now = Date.now()): string {
-  if (rows.length === 0) return 'no projects registered yet; `contextd init` or `contextd attach` registers one';
+  if (rows.length === 0) {
+    return 'no projects registered yet; a project registers itself on its next agent session, or run `contextd projects add` in it';
+  }
   const lines = [
     `${'project'.padEnd(44)} ${'items'.padStart(6)} ${'pending'.padStart(8)}  ${'recovery'.padEnd(9)} ${'hard'.padStart(5)}  last activity`,
   ];
@@ -75,6 +77,7 @@ export function formatOverview(rows: readonly ProjectSummary[], now = Date.now()
         `${r.lastActivity ? ago(r.lastActivity, now) : 'never'}`,
     );
   }
+  if (rows.some((r) => r.status === 'missing')) lines.push('', 'gone projects can be dropped from this list with `contextd projects prune`');
   return lines.join('\n');
 }
 

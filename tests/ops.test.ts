@@ -22,7 +22,8 @@ import {
   writeMirror,
 } from '../src/ops/mirror.js';
 import { formatOverview, summarizeProject } from '../src/ops/overview.js';
-import { readRegistry, registerProject, registryPath, unregisterProject } from '../src/ops/registry.js';
+import { entryIsLive, filterRegistry, readRegistry, registerProject, registryPath, unregisterProject } from '../src/ops/registry.js';
+import { dbPath } from '../src/store/db.js';
 import { isOurHookCommand, resolveCommand } from '../src/ops/self.js';
 import type { EmbeddingProvider } from '../src/store/embeddings.js';
 import { makeManager } from './helpers.js';
@@ -553,6 +554,15 @@ describe('status --all', () => {
       // Read-only: a missing project is not created by being looked at.
       expect(existsSync(ghost)).toBe(false);
       expect(formatOverview(rows)).toContain('(storage missing)');
+      expect(formatOverview(rows)).toContain('contextd projects prune');
+
+      // Pruning keeps what still has memory and never touches that memory.
+      expect(entries.filter((e) => !entryIsLive(e, dbPath)).map((e) => e.root)).toEqual([ghost]);
+      const pruned = filterRegistry(path, (e) => entryIsLive(e, dbPath));
+      expect(pruned.map((e) => e.root)).toEqual([ghost]);
+      expect(filterRegistry(path, (e) => entryIsLive(e, dbPath))).toEqual([]);
+      expect(existsSync(dbPath(manager.storageDir))).toBe(true);
+      registerProject(path, ghost, join(ghost, '.context'));
 
       expect(unregisterProject(path, ghost)).toBe(true);
       expect(readRegistry(path)).toHaveLength(1);

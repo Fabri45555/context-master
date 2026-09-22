@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -20,7 +20,8 @@ import {
 } from '../adapters/index.js';
 import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/state.js';
 import { isOurHookCommand, launchString, selfLaunch } from '../ops/self.js';
-import { registerProject, readRegistry, registryPath, unregisterProject } from '../ops/registry.js';
+import { entryIsLive, filterRegistry, registerProject, readRegistry, registryPath, unregisterProject } from '../ops/registry.js';
+import { dbPath } from '../store/db.js';
 import { mcpInstall, mcpStatus, mcpUninstall, purge, purgeTargets, uninstallWiring } from '../ops/install.js';
 import {
   candidateMirrorFiles,
@@ -34,7 +35,7 @@ import { applyNativeImport, planNativeImport } from '../ops/import-native.js';
 import { formatOverview, summarizeProject } from '../ops/overview.js';
 import { createInterface } from 'node:readline/promises';
 import { isProtected, StatePatchSchema } from '../core/patch.js';
-import { CONFIG_FILENAMES, findConfigFile, type WorkerTask } from '../core/config.js';
+import { CONFIG_FILENAMES, findConfigFile, loadConfig, type WorkerTask } from '../core/config.js';
 import { ContextManager } from '../daemon/manager.js';
 import { formatMetrics, formatPressure } from '../metrics/index.js';
 import { benchmark, formatBench } from '../bench/index.js';
@@ -172,6 +173,15 @@ function noteProject(m: ContextManager): void {
   registerProject(registryPath(homedir(), process.env), m.projectRoot, m.storageDir);
 }
 
+/**
+ * The same, for commands that also run in directories nobody set up: opening a manager creates
+ * storage, so a stray `contextd status` in the wrong directory must not add it to every future
+ * `status --all`. A config file or an observed session is the evidence of real use.
+ */
+function noteProjectIfInUse(m: ContextManager): void {
+  if (m.loaded.path != null || m.store.lastActivity() != null) noteProject(m);
+}
+
 function printMcpChange(adapter: string, c: McpChange): void {
   out(`${adapter}: ${c.status.padEnd(10)} [${c.scope}] ${c.detail}`);
   if (c.status === 'conflict' || c.status === 'failed') process.exitCode = 1;
@@ -210,6 +220,9 @@ program
       // SessionStart is the one hook where returning context is useful: it becomes the
       // agent's starting brief, which is exactly PRD 21's bootstrap injection.
       if (payload.hook_event_name === 'SessionStart') {
+        // Projects set up before the registry existed appear in `status --all` from their next
+        // session. Once per session, and a no-op read when the entry is already current.
+        noteProject(m);
         const built = m.serveBootstrap(sessionId);
         if (built.text.length > 0) {
           out(
@@ -413,6 +426,7 @@ program
     }
     const m = manager(cmd);
     try {
+      noteProjectIfInUse(m);
       const metrics = m.metrics((opts.session as string) ?? null);
       out(opts.json ? JSON.stringify(metrics, null, 2) : formatMetrics(metrics));
     } finally {
@@ -1102,6 +1116,7 @@ program
   .option('--host <addr>', 'bind address; loopback by default', '127.0.0.1')
   .action(async (opts, cmd) => {
     const m = manager(cmd);
+    noteProjectIfInUse(m);
     const handle = await startUi(m, { port: Number(opts.port), host: opts.host as string });
     out(`contextd ui on ${handle.url}`);
     if (opts.host !== '127.0.0.1' && opts.host !== 'localhost') {
@@ -1390,6 +1405,109 @@ program
 
 // ------------------------------------------------------------------ doctor
 
+// --------------------------------------------------------------- projects
+
+/*
+ * The registry behind `status --all` is a list of paths, and it goes stale: projects get moved,
+ * deleted, or were only ever a test. Cleaning it must not mean editing a JSON file by hand, and
+ * none of these touch a project's memory - that is `uninstall --purge`, run in the project.
+ */
+const projects = program
+  .command('projects')
+  .description('the projects `status --all` lists: show, add, remove, prune (memory is never touched)');
+
+function registryFile(): string {
+  return registryPath(homedir(), process.env);
+}
+
+projects
+  .command('list', { isDefault: true })
+  .description('every registered project, and whether its memory is still there')
+  .option('--json', 'machine-readable output', false)
+  .action((opts) => {
+    const path = registryFile();
+    const rows = readRegistry(path).map((e) => ({ ...e, live: entryIsLive(e, dbPath) }));
+    if (opts.json) {
+      out(JSON.stringify(rows, null, 2));
+      return;
+    }
+    if (rows.length === 0) {
+      out(`no projects registered (${path})`);
+      return;
+    }
+    for (const r of rows) out(`${r.live ? '  ' : '✗ '}${r.root}${r.live ? '' : '   (gone - contextd projects prune)'}`);
+    out(`\n${rows.length} project(s) in ${path}`);
+  });
+
+projects
+  .command('add')
+  .description('register a project that already has contextd memory (default: this one)')
+  .argument('[dir]', 'project directory')
+  .action((dir: string | undefined, _opts, cmd) => {
+    // Config only, no manager: opening one would create storage in whatever directory was typed.
+    const loaded = loadConfig(resolve(dir ?? (cmd.optsWithGlobals().cwd as string) ?? process.cwd()));
+    if (!existsSync(dbPath(loaded.storageDir))) {
+      out(`${loaded.root} has no contextd memory; run \`contextd init\` there first`);
+      process.exitCode = 1;
+      return;
+    }
+    registerProject(registryFile(), loaded.root, loaded.storageDir);
+    out(`registered ${loaded.root}`);
+  });
+
+projects
+  .command('remove')
+  .description("forget projects in the registry; their memory and wiring stay as they are")
+  .argument('<dirs...>', 'project directories, as listed')
+  .action((dirs: string[]) => {
+    // Entries hold the resolved root (macOS /var is /private/var), so resolve what was typed the same way.
+    const real = (d: string) => {
+      const abs = resolve(d);
+      try {
+        return realpathSync(abs);
+      } catch {
+        return abs;
+      }
+    };
+    const roots = new Set(dirs.flatMap((d) => [resolve(d), real(d)]));
+    const dropped = filterRegistry(registryFile(), (e) => !roots.has(e.root));
+    for (const e of dropped) out(`removed ${e.root}`);
+    const missed = dirs.filter((d) => !dropped.some((e) => e.root === resolve(d) || e.root === real(d)));
+    for (const r of missed) out(`not registered: ${r}`);
+    if (missed.length > 0 && dropped.length === 0) process.exitCode = 1;
+  });
+
+projects
+  .command('prune')
+  .description('drop entries whose directory or memory no longer exists')
+  .option('--dry-run', 'show what would be dropped', false)
+  .action((opts) => {
+    const path = registryFile();
+    const gone = readRegistry(path).filter((e) => !entryIsLive(e, dbPath));
+    if (gone.length === 0) {
+      out('nothing to prune');
+      return;
+    }
+    const dropped = opts.dryRun === true ? gone : filterRegistry(path, (e) => entryIsLive(e, dbPath));
+    for (const e of dropped) out(`${opts.dryRun === true ? 'would remove' : 'removed'} ${e.root}`);
+  });
+
+projects
+  .command('clear')
+  .description('empty the registry (projects re-register on their next session)')
+  .option('--yes', 'confirm', false)
+  .action((opts) => {
+    const path = registryFile();
+    const n = readRegistry(path).length;
+    if (opts.yes !== true) {
+      out(`this forgets all ${n} registered project(s) - their memory is kept. Re-run with --yes.`);
+      process.exitCode = 1;
+      return;
+    }
+    const dropped = filterRegistry(path, () => false);
+    out(`cleared ${dropped.length} project(s)`);
+  });
+
 program
   .command('doctor')
   .description('check that ingestion, providers, budgets and the patch log are wired correctly')
@@ -1397,6 +1515,7 @@ program
   .action((opts, cmd) => {
     const m = manager(cmd);
     try {
+      noteProjectIfInUse(m);
       const checks = diagnose(m);
       out(opts.json ? JSON.stringify(checks, null, 2) : formatChecks(checks));
       // Non-zero on failure so this is usable in a setup script or CI step.
