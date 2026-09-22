@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { collectBenefits } from '../src/metrics/benefits.js';
 import { collectHistory, toWeeks, weekOf, type HistoryBucket } from '../src/metrics/history.js';
 import { MIRROR_LABEL } from '../src/ops/mirror.js';
+import { collectRequests } from '../src/metrics/requests.js';
 import { makeManager } from './helpers.js';
 
 /**
@@ -81,6 +82,21 @@ describe('savings history', () => {
       expect(history.discarded_undated).toBe(m.events.discarded);
       expect(history.daily.map((b) => b.start)).toEqual([...history.daily.map((b) => b.start)].sort());
       expect(history.weekly.reduce((n, b) => n + b.resumes, 0)).toBe(2);
+
+      // Per request: the same rows, the same window, so the savings add up to the same total.
+      const log = collectRequests(manager.store, manager.config, manager.projectRoot);
+      expect(log.total).toBe(5);
+      expect(log.rows.map((r) => r.kind).reverse()).toEqual(['resume', 'resume', 'resume_repeat', 'mirror', 'query']);
+      expect(log.resumes).toBe(benefits.delivery.resumes);
+      expect(log.queries).toBe(benefits.delivery.query);
+      expect(log.tokens_avoided).toBe(benefits.delivery.tokens_avoided);
+      expect(log.rows.reduce((n, r) => n + (r.avoided_tokens ?? 0), 0)).toBe(benefits.delivery.tokens_avoided);
+      // A query has no measured alternative: a dash, never an invented saving.
+      const query = log.rows.find((r) => r.kind === 'query')!;
+      expect(query.avoided_tokens).toBeNull();
+      expect(query.query).toBe('writer');
+      expect(log.rows.find((r) => r.kind === 'resume_repeat')!.avoided_tokens).toBe(0);
+      expect(collectRequests(manager.store, manager.config, manager.projectRoot, 2).rows).toHaveLength(2);
     } finally {
       cleanup();
     }

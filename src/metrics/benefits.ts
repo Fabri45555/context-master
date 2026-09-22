@@ -205,7 +205,7 @@ export function collectBenefits(
 }
 
 /** Bootstrap deliveries this close together are one resume, served twice (hook and MCP). */
-const RESUME_WINDOW_MS = 10 * 60_000;
+export const RESUME_WINDOW_MS = 10 * 60_000;
 
 export interface ResumeServe {
   at: string;

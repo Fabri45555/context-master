@@ -841,6 +841,13 @@ step per resume — and a Daily/Weekly table of resumes, queries, events, the sh
 and worker spend. All of it is rebuilt from logs contextd already keeps (`GET /api/history`), so it
 starts with your first session and nothing extra is stored.
 
+**Requests** (Activity, and the last few on the Overview) lists every time memory reached an
+agent — like headroom's per-request table — with the tokens it served and what it saved. Only a
+resume has a measurable saving: the project documents it did not re-read, minus what it was
+served; the second serve of the same resume shows 0. A query inside a session shows its cost and a
+dash, because that session already held its context and there is no honest "without memory" to
+subtract. The per-request savings add up to exactly the Benefits total (`GET /api/requests`).
+
 The Overview opens with what the tool has bought this project, each figure with the baseline it is
 measured against:
 

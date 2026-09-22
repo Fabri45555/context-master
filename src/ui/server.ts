@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { collectBenefits } from '../metrics/benefits.js';
 import { collectHistory } from '../metrics/history.js';
+import { collectRequests } from '../metrics/requests.js';
 import { collectMetrics } from '../metrics/index.js';
 import { MEMORY_CATEGORIES } from '../core/state.js';
 import { diagnose, worstStatus } from '../daemon/doctor.js';
@@ -128,6 +129,23 @@ async function handle(
           metrics,
           benefits: collectBenefits(manager.store, manager.config, metrics, manager.projectRoot, sessionId),
         });
+        return;
+      }
+
+      case '/api/requests': {
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 100) || 100));
+        const log = collectRequests(manager.store, manager.config, manager.projectRoot, limit);
+        // Enough of each served item to read the row without a second request; retired items
+        // are still named, since the log is about what the agent was handed at the time.
+        const items = new Map<string, { id: string; category: string; text: string } | null>();
+        for (const r of log.rows) {
+          for (const id of r.item_ids) {
+            if (items.has(id)) continue;
+            const i = manager.store.getItem(id);
+            items.set(id, i ? { id: i.id, category: i.category, text: i.text.slice(0, 160) } : null);
+          }
+        }
+        send(res, 200, { ...log, items: Object.fromEntries(items) });
         return;
       }
 

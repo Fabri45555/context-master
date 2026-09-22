@@ -63,7 +63,7 @@ describe('dashboard server', () => {
   it('keeps every endpoint the page calls', async () => {
     const url = await serve();
     for (const path of ['/api/overview', '/api/benefits', '/api/memory', '/api/conflicts', '/api/graph',
-      '/api/events', '/api/patches', '/api/context', '/api/health', '/api/history',
+      '/api/events', '/api/patches', '/api/context', '/api/health', '/api/history', '/api/requests',
       '/api/overview?scope=session', '/api/benefits?scope=session']) {
       const res = await fetch(url + path);
       expect(res.status, path).toBe(200);

@@ -235,6 +235,12 @@ export function renderPage(version = '', appVersion = ''): string {
   .rows .used { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
   .rows.fixed .side { width: 220px; }
   .rows.patches .side { width: 250px; }
+  .rows.reqs .side { width: 300px; justify-content: flex-end; }
+  .rows.reqs .kind { width: 64px; display: inline-flex; justify-content: center; }
+  .rows.reqs .tok { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+  .rows.reqs .tok small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; line-height: 1.1; }
+  .rows .items-list { margin: 6px 0 0; padding-left: 0; list-style: none; }
+  .rows .items-list li { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; }
   .rows .more { padding: 4px 14px 14px 14px; border-top: 1px dashed var(--line); background: var(--surface-2); }
   .kv.wm > div { justify-content: flex-start; }
   .kv.wm dt { width: 110px; flex: none; color: var(--muted); }
@@ -330,7 +336,7 @@ export function renderPage(version = '', appVersion = ''): string {
     .scroll { margin: 0 -14px; padding: 0 14px; }
     .rows summary { flex-wrap: wrap; padding: 9px 12px; }
     .rows .main { flex-basis: 100%; order: -1; }
-    .rows.fixed .side, .rows.patches .side { width: auto; }
+    .rows.fixed .side, .rows.patches .side, .rows.reqs .side { width: auto; }
     .rows .more .kv dt, .kv.wm dt { width: 90px; }
     #tools { flex-basis: 100%; }
     .search { max-width: none; }
@@ -399,6 +405,7 @@ const VIEWS = [
   { id: 'history', label: 'History',
     caption: 'What memory has saved over time, how it has been used, and the agent sessions it was built from.' },
   { id: 'activity', label: 'Activity', subs: [
+    ['requests', 'Requests', 'Every time memory reached an agent, newest first, with what it cost and what it saved. Click a row for the items it was handed.'],
     ['events', 'Events', 'The most recent events observed from the agent, newest first. Click a row for the full preview.'],
     ['patches', 'Patch log', 'Every change to memory, newest first. The patch log is the source of truth; memory is its replay.'],
   ] },
@@ -407,6 +414,7 @@ const VIEWS = [
 const LEGACY = {
   benefits: 'overview', conflicts: 'memory/conflicts', graph: 'memory/relations', context: 'memory/context',
   events: 'activity/events', patches: 'activity/patches', sessions: 'history', items: 'memory/items',
+  requests: 'activity/requests',
 };
 
 /*
@@ -588,7 +596,7 @@ function scopeCaption(scope, sessions) {
 async function drawOverview() {
   const session = route.q.scope === 'session';
   const qs = session ? '?scope=session' : '';
-  const [bd, d] = await Promise.all([get('/api/benefits' + qs), get('/api/overview' + qs)]);
+  const [bd, d, rq] = await Promise.all([get('/api/benefits' + qs), get('/api/overview' + qs), get('/api/requests?limit=200')]);
   const b = bd.benefits, m = d.metrics;
   const r = b.resume, dl = b.delivery, t = b.triage, pr = b.protection, c = b.continuity, q = b.quality;
   const p = m.lifecycle.pressure;
@@ -731,6 +739,13 @@ async function drawOverview() {
     ['Events stored', num(m.events.stored) + ' <small>· ' + num(m.events.discarded) + ' discarded</small>'],
   ]));
   html += '</div>';
+
+  const sid = session && d.scope.session ? d.scope.session.id : null;
+  const recent = rq.rows.filter((x) => !sid || x.session_id === sid).slice(0, 6);
+  html += '<div style="margin-top:14px">' + card('Recent requests',
+    recent.length ? requestRows(rq, recent)
+      : empty(sid ? 'No memory has reached this session yet.' : 'No memory has reached an agent yet.'),
+    '<a href="#activity/requests">all ' + num(rq.total) + ' →</a>', 'wide') + '</div>';
 
   if (b.caveats.length) {
     html += '<details class="howto" data-k="caveats" style="margin-top:14px"><summary><span class="chev">›</span> How to read these numbers</summary><ul>' +
@@ -1113,6 +1128,81 @@ async function drawHistory() {
 }
 
 // ---------------------------------------------------------------- activity
+// --------------------------------------------------------------- requests
+/*
+ * headroom's "Recent requests", for a tool that is not on the wire: one row per delivery of
+ * memory. Only a resume has a measured alternative (re-reading the project's documents), so only
+ * a resume shows a saving; a query shows what it cost and a dash, because the session asking it
+ * already held its context and inventing a counterfactual would make the column marketing.
+ */
+const REQ_KIND = {
+  resume: ['resume', 'good', 'A session started or resumed from memory instead of re-reading the documents'],
+  resume_repeat: ['resume', '', 'The same resume served again (hook, then memory_bootstrap): no second saving'],
+  query: ['query', 'accent', 'A targeted question inside a session'],
+  mirror: ['mirror', '', 'The bootstrap written into an instruction file: not an agent context'],
+  empty: ['empty', 'warn', 'A bootstrap with nothing in it: memory was empty'],
+};
+
+function reqTitle(r) {
+  if (r.kind === 'query') return esc(r.query);
+  if (r.kind === 'resume') return 'Session start: the bootstrap';
+  if (r.kind === 'resume_repeat') return '<span class="muted">Same resume, served again</span>';
+  if (r.kind === 'mirror') return '<span class="muted">Copy written to an instruction file</span>';
+  return '<span class="muted">Bootstrap with no memory in it</span>';
+}
+
+function savedCell(r) {
+  if (r.avoided_tokens == null) return '<span class="muted" title="no measured alternative for a query">–</span>';
+  if (r.avoided_tokens === 0) return '<span class="muted">0</span>';
+  return '<b class="good-t">' + compact(r.avoided_tokens) + '</b>';
+}
+
+function requestRow(r, items) {
+  const [label, tone, why] = REQ_KIND[r.kind] || [r.kind, '', ''];
+  const list = r.item_ids.map((id) => {
+    const it = items[id];
+    return '<li>' + idTag(id) + (it ? chip(it.category.replace(/_/g, ' ')) + '<span>' + esc(it.text) + '</span>' : '<span class="muted">no longer in memory</span>') + '</li>';
+  }).join('');
+  const saved = r.avoided_tokens == null
+    ? '<span class="muted">not measured</span> <small>— a query inside a session has no “without memory” to compare against</small>'
+    : r.kind === 'resume'
+      ? '<b class="good-t">' + num(r.avoided_tokens) + '</b> <small>tokens = ' + num(r.alternative_tokens) + ' of project documents − ' + num(r.tokens) + ' served</small>'
+      : '0 <small>— counted once, at the first serve of this resume</small>';
+  return '<details data-k="r:' + esc(r.id) + '"><summary><span class="t">' + when(r.at) + '</span>' +
+    '<span class="main one">' + reqTitle(r) + '</span>' +
+    '<span class="side"><span class="kind">' + chip(label, tone, why) + '</span>' +
+    '<span class="tok">' + num(r.tokens) + '<small>served</small></span>' +
+    '<span class="tok">' + savedCell(r) + '<small>saved</small></span></span></summary>' +
+    '<div class="more">' + kv([
+      ['Kind', esc(why)],
+      ['Served', num(r.tokens) + ' <small>tokens · ' + plural(r.item_ids.length, 'item') + '</small>'],
+      ['Saved', saved],
+      ['Session', r.session_id ? idTag(r.session_id) : '<small>not known (an MCP call before session inference)</small>'],
+      ['Time', esc(full(r.at))],
+    ]) + (list ? '<ul class="items-list">' + list + '</ul>' : '') + '</div></details>';
+}
+
+function requestRows(log, rows) {
+  return '<div class="rows reqs">' + rows.map((r) => requestRow(r, log.items || {})).join('') + '</div>';
+}
+
+async function drawRequests() {
+  const log = await get('/api/requests?limit=200');
+  if (!log.total) {
+    return '<div class="rows">' + empty('No memory has reached an agent yet. Register the MCP server and start a session:', 'contextd mcp install') + '</div>';
+  }
+  const head = '<div class="kpis" style="margin-bottom:14px">' +
+    kpi('Requests', num(log.total), plural(log.resumes, 'resume') + ' · ' + plural(log.queries, 'query', 'queries')) +
+    kpi('Tokens saved', compact(log.tokens_avoided), 'over ' + plural(log.resumes, 'resume'), log.tokens_avoided > 0 ? 'good' : '') +
+    kpi('Tokens served', compact(log.tokens_served), 'memory put in front of an agent') +
+    kpi('Per resume', compact(log.rebuild_tokens), 'project documents a resume would re-read' + (log.rebuild_source === 'config' ? ' (configured)' : '')) +
+    '</div>';
+  const note = '<p class="caption" style="margin:12px 0 0">Only a resume saves something measurable: the project documents it did not re-read, minus what it was served. ' +
+    'A query inside a session shows its cost and a dash — the session already held its context, so there is no honest “without memory” to subtract. ' +
+    'Showing ' + plural(log.rows.length, 'request') + ' of ' + num(log.total) + '.</p>';
+  return head + requestRows(log, log.rows) + note;
+}
+
 async function drawEvents() {
   const list = await get('/api/events?limit=200');
   if (!list.length) {
@@ -1185,7 +1275,7 @@ const DRAW = {
   'memory/items': drawItems, 'memory/conflicts': drawConflicts, 'memory/relations': drawRelations,
   'memory/context': drawContext,
   history: drawHistory,
-  'activity/events': drawEvents, 'activity/patches': drawPatches,
+  'activity/requests': drawRequests, 'activity/events': drawEvents, 'activity/patches': drawPatches,
 };
 
 // ------------------------------------------------------------------ chrome
