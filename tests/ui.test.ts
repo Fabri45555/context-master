@@ -141,6 +141,15 @@ describe('dashboard page', () => {
     expect(html).not.toMatch(/@import|url\(http/);
   });
 
+  it('carries a banner for the runtime check, hidden until health reports one', () => {
+    const html = renderPage();
+    // A dashboard behind the build answers every tab with old code, so the warning sits above
+    // them all rather than inside the health popover. `.advice[hidden]` keeps it off until then.
+    expect(html).toContain('id="stale"');
+    expect(html).toContain('.advice[hidden] { display: none; }');
+    expect(html).toContain("h.checks.find((c) => c.name === 'runtime')");
+  });
+
   it('maps every old tab hash to a view', () => {
     const html = renderPage();
     for (const old of ['benefits', 'conflicts', 'graph', 'context', 'events', 'patches']) {

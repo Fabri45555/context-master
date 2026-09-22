@@ -340,6 +340,16 @@ Breaking one of these breaks a PRD guarantee, so change them deliberately or not
     package.json version. A fix that was built but never reaches the agent looks exactly like a
     fix that did not work.
 
+    The same holds for a process that has outlived its build (`runDrift`): Node keeps the modules
+    it imported at startup, so `contextd ui` left open across a rebuild serves the old behaviour
+    for as long as it runs. It compares the process's own start time — from `process.uptime()`, no
+    `ps` — with the newest `.js` of the build the entry came from, and the `runtime` check is
+    emitted only when it is behind, since a command that just started can never fail it. The
+    dashboard says it above every tab, because every figure on them came from that process. The
+    failure it prevents happened: the dashboard kept reporting a contradiction that
+    `conflict_reviews` (65) had already silenced, and `conflicts`, `reconcile` and `memory_conflicts`
+    all disagreed with it — the data was right and the running code was two builds old.
+
 61. **A project registers itself only on evidence of use.** `status --all` reads a registry of
     roots. A SessionStart hook, `init`, `attach` and `mcp install` add the project; `status`,
     `doctor` and `ui` add it only where a config file or an observed session exists, because

@@ -16,7 +16,7 @@ import {
 import { claudeHookInstaller } from '../src/adapters/claude/hooks.js';
 import { opencodeUserConfig } from '../src/adapters/opencode/index.js';
 import { diagnose } from '../src/daemon/doctor.js';
-import { buildDrift, newestSource } from '../src/daemon/drift.js';
+import { buildDrift, newestSource, runDrift } from '../src/daemon/drift.js';
 import { mcpInstall, mcpStatus, mcpUninstall, uninstallWiring } from '../src/ops/install.js';
 import {
   checkMirror,
@@ -350,5 +350,51 @@ describe('doctor: build drift', () => {
     writeFileSync(join(pkg, 'dist', 'index.js'), '');
     expect(buildDrift(join(pkg, 'dist', 'index.js'), pkg)).toMatchObject({ newerSource: null, versionMismatch: null });
     expect(buildDrift(join(pkg, 'dist', 'gone.js'), pkg)).toBeNull();
+  });
+
+  it('notices a process that has outlived the build it loaded, and only then', () => {
+    const c = checkout('0.1.0');
+    const now = Date.now();
+    // A second file of the same build: the whole directory is compared, not just the entry,
+    // so an incremental rebuild that only rewrote one module is still caught.
+    const other = join(c.root, 'dist', 'cli', 'doctor.js');
+    writeFileSync(other, '');
+    at(c.script, now - 3_600_000);
+    at(other, now);
+
+    const stale = runDrift({ entry: c.script, startedAt: now - 3_600_000 });
+    expect(stale).toMatchObject({ newest: other, buildDir: join(c.root, 'dist') });
+    expect(stale!.behindMs).toBeGreaterThan(3_000_000);
+
+    // Started after the build: nothing to say. Same for a process running from source.
+    expect(runDrift({ entry: c.script, startedAt: now + 10_000 })).toBeNull();
+    expect(runDrift({ entry: c.source, startedAt: now - 3_600_000 })).toBeNull();
+    expect(runDrift({ entry: join(c.root, 'dist', 'cli', 'gone.js'), startedAt: 0 })).toBeNull();
+  });
+
+  it('warns in doctor when the process answering the check is behind the build', () => {
+    const { manager, cleanup } = makeManager();
+    try {
+      const c = checkout('0.1.0');
+      const now = Date.now();
+      at(c.script, now);
+      const runtime = (startedAt: number) =>
+        diagnose(manager, {
+          host: host(manager.projectRoot),
+          checkoutRoot: c.root,
+          runtime: { entry: c.script, startedAt, command: 'contextd ui' },
+        }).find((x) => x.name === 'runtime');
+
+      const warned = runtime(now - 1_800_000);
+      expect(warned).toMatchObject({ status: 'warn', fix: 'restart it: contextd ui' });
+      expect(warned?.detail).toContain('30m before the build it runs');
+      expect(warned?.detail).toContain('cli/index.js was written since');
+
+      // A command that just started runs exactly what it was built from: no check at all,
+      // rather than one that can never fail.
+      expect(runtime(now + 10_000)).toBeUndefined();
+    } finally {
+      cleanup();
+    }
   });
 });

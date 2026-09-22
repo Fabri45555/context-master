@@ -122,7 +122,7 @@ one are in [docs/invariants.md](docs/invariants.md) — read the entry before ch
 57. **An agent contextd cannot observe says so:** surface `none`; ingestion refuses it; `doctor` only notes it.
 58. **In a JSON config, ours is proven by shape** (`isContextdLaunch`); never replace an entry we did not write.
 59. **A mirror fits its reader's budget by dropping items,** never by cutting text.
-60. **A stale build is a warning, found by stat alone** (`drift.ts`).
+60. **A stale build is a warning, found by stat alone** (`drift.ts`) — and so is a process still running one.
 61. **A project registers itself only on evidence of use;** `contextd projects` cleans the registry, never memory.
 62. **Advice about the context goes to the person, never into it** (`clearAdvice`, `systemMessage`), once per level.
 63. **A status line someone had is never lost:** settings.local.json only; `--chain` keeps it, uninstall restores it.

@@ -20,7 +20,7 @@ import { MCP_SERVER_NAME, servesProject } from '../ops/install.js';
 import { isOurHookCommand, resolveCommand } from '../ops/self.js';
 import type { ContextManager } from './manager.js';
 import { staleReferences } from './stale.js';
-import { buildDrift, packageRootOf, scriptBehind } from './drift.js';
+import { buildDrift, packageRootOf, runDrift, scriptBehind } from './drift.js';
 import { collectToolCalls, detectLoops } from '../core/loops.js';
 
 /**
@@ -48,6 +48,11 @@ export interface DiagnoseOptions {
   pullWindowDays?: number;
   /** Package root of the contextd running this check; defaults to this file's. */
   checkoutRoot?: string | null;
+  /**
+   * The process answering this check, for "is it still running the build on disk". Defaults to
+   * this one; tests pass an entry and a start time instead of starting a process.
+   */
+  runtime?: { entry?: string | null; startedAt?: number; command?: string | null };
 }
 
 export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): Check[] {
@@ -61,6 +66,7 @@ export function diagnose(manager: ContextManager, opts: DiagnoseOptions = {}): C
   checks.push(...mcpChecks(host, wiring));
   const checkoutRoot = opts.checkoutRoot !== undefined ? opts.checkoutRoot : packageRootOf(fileURLToPath(import.meta.url));
   checks.push(...buildChecks(host, wiring, checkoutRoot));
+  checks.push(...runtimeChecks(opts.runtime ?? {}));
   checks.push(...providerChecks(config));
   checks.push(...budgetChecks(config));
   checks.push(...latencyChecks(manager));
@@ -305,6 +311,37 @@ function buildChecks(host: HostEnv, wiring: Wiring, checkoutRoot: string | null)
     });
   }
   return out;
+}
+
+/**
+ * Whether the process answering this check is still the build on disk.
+ *
+ * `buildChecks` asks whether the build is current; this asks whether what is *running* is.
+ * A short-lived command can only ever answer yes, so the check is emitted just when it is behind:
+ * in practice that is `contextd ui`, left open across a rebuild and quietly serving the old code
+ * while every other surface shows the new one.
+ */
+function runtimeChecks(runtime: NonNullable<DiagnoseOptions['runtime']>): Check[] {
+  const drift = runDrift(runtime);
+  if (!drift) return [];
+  const rel = relative(drift.buildDir, drift.newest) || drift.newest;
+  const command = runtime.command !== undefined ? runtime.command : selfCommand();
+  return [
+    {
+      name: 'runtime',
+      status: 'warn',
+      detail:
+        `this process started ${describeSpan(drift.behindMs)} before the build it runs ` +
+        `(${rel} was written since): it is running code the build has replaced`,
+      fix: command ? `restart it: ${command}` : 'restart it',
+    },
+  ];
+}
+
+/** How this process was started, well enough to name it in a fix hint. */
+function selfCommand(argv = process.argv): string | null {
+  const sub = argv[2];
+  return sub && /^[a-z][a-z-]*$/.test(sub) ? `contextd ${sub}` : null;
 }
 
 function describeSpan(ms: number): string {

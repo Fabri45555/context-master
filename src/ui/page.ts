@@ -240,6 +240,9 @@ export function renderPage(version = '', appVersion = ''): string {
             border: 1px solid var(--line); border-left-width: 3px; border-radius: var(--r); background: var(--surface); font-size: 13px; }
   .advice.good { border-left-color: var(--good); } .advice.good b { color: var(--good); }
   .advice.warn { border-left-color: var(--warn); } .advice.warn b { color: var(--warn); }
+  /* display:flex above would otherwise beat the browser's [hidden] rule. */
+  .advice[hidden] { display: none; }
+  #stale { margin: 0 0 14px; }
   .rows.reqs .kind { width: 64px; display: inline-flex; justify-content: center; }
   .rows.reqs .tok { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; }
   .rows.reqs .tok small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .04em; text-transform: uppercase; line-height: 1.1; }
@@ -374,6 +377,7 @@ export function renderPage(version = '', appVersion = ''): string {
   </div>
 </header>
 <main>
+  <div class="advice warn" id="stale" role="status" hidden></div>
   <div class="bar" id="bar"><nav class="seg sub" id="subnav" role="tablist" aria-label="Sections"></nav><div id="tools"></div></div>
   <p class="caption" id="caption"></p>
   <div id="panel"><div class="empty">loading…</div></div>
@@ -1471,6 +1475,15 @@ async function loadHealth() {
     : bad.length ? bad.length + ' failing'
     : warn.length ? plural(warn.length, 'warning') : 'Healthy';
   pill.innerHTML = '<i class="dot ' + tone + '"></i><span>' + label + '</span>';
+  // Every number on every tab comes from this process, so a process behind the build is said
+  // once, above all of them, not inside the health popover where it would be one line of many.
+  const stale = h.checks.find((c) => c.name === 'runtime');
+  const bar = $('stale');
+  bar.hidden = !stale;
+  if (stale) {
+    bar.innerHTML = '<b>This dashboard is running an old build</b><span>' + esc(stale.detail) +
+      (stale.fix ? ' — ' + esc(stale.fix) : '') + '</span>';
+  }
   const issues = bad.concat(warn);
   const passing = h.checks.filter((c) => c.status === 'ok').length;
   const html = h.status === 'error'
