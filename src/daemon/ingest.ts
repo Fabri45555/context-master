@@ -169,6 +169,7 @@ export class IngestPipeline {
     return {
       history,
       issueForEvent: (id) => this.store.issueRecordedFrom(id),
+      recoveryRules: (kind, key) => this.store.recoveryRulesFor(kind, key),
       root: this.projectRoot,
     };
   }

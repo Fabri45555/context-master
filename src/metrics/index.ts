@@ -1,6 +1,7 @@
 import { estimateTokens } from '../core/events.js';
 import type { Config } from '../core/config.js';
 import { assessPressure, type PressureAssessment } from '../core/lifecycle.js';
+import { summarizeLoops, type LoopSummary } from '../core/loops.js';
 import { ContextBuilder } from '../retrieval/context-builder.js';
 import { INERT_REASON, type ContextStore } from '../store/store.js';
 
@@ -94,12 +95,22 @@ export interface Metrics {
   };
   /** K3 - worker cost as a share of total measured spend. */
   overhead_ratio: number | null;
+  /**
+   * The agent repeating one call with the same answer and nothing changed in between (headroom's
+   * loop detection, stricter). A measurement of the sessions read, never memory (invariant 28).
+   */
+  loops: LoopSummary;
 }
+
+/** How many of the most recent sessions `loops` reads when no session is named. */
+export const LOOP_SESSIONS = 20;
 
 export function collectMetrics(
   store: ContextStore,
   config: Config,
   sessionId: string | null,
+  /** Project root, so the project's own files are never mistaken for another process's output. */
+  root: string | null = null,
 ): Metrics {
   const db = store.db;
   const scope = sessionId ? ` WHERE session_id = ?` : '';
@@ -196,6 +207,10 @@ export function collectMetrics(
   const hookLatency = store.latencyStats('hook');
   const ingestLatency = store.latencyStats('ingest');
 
+  // Status is not the hook path (invariant 17), but a store holds months of sessions: the recent
+  // ones are what "is the agent looping" is about.
+  const loops = summarizeLoops(store.sessionTraffic(sessionId, LOOP_SESSIONS), root);
+
   const derived = Math.max(0, evTotals.n - evTotals.p - evTotals.inert);
   // Coverage asks: of the events that were ever going to produce state, how many have?
   //
@@ -279,6 +294,7 @@ export function collectMetrics(
       within_budget: hookLatency ? hookLatency.p95 <= config.limits.hook_latency_ms : null,
     },
     overhead_ratio: overhead,
+    loops,
   };
 }
 
@@ -352,6 +368,14 @@ export function formatMetrics(m: Metrics): string {
     if (m.latency.within_budget === false) {
       lines.push('  hook p95 is OVER budget: the agent is waiting on us');
     }
+  }
+  if (m.loops.sessions_scanned > 0) {
+    lines.push('');
+    const w = m.loops.worst;
+    lines.push(
+      `Agent loops:          ${m.loops.sessions_with_loops} of ${m.loops.sessions_scanned} recent session(s)` +
+        (w ? ` - worst: ${w.tool} repeated ${w.repeats}x${w.error_loop ? ', failing each time' : ''} (\`${w.call.slice(0, 60)}\`)` : ''),
+    );
   }
   if (m.retrieval.count > 0) {
     lines.push('');

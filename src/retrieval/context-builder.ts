@@ -198,6 +198,35 @@ function pack(
   return { title, lines, tokens, dropped, itemIds, clippedIds, droppedCategories, droppedIds };
 }
 
+/**
+ * The most learned command rules (`recovery` conventions) one bootstrap serves.
+ *
+ * They share the constraints section with what the user and the workers stated, and the fold
+ * writes one per recovered mistake, so without a cap a long-lived project's bootstrap would fill
+ * with them and push out the constraints. headroom serves 15, in a file of its own; here they
+ * compete for one section, so fewer. The rest stay one `memory_query category="conventions"` away.
+ */
+export const MAX_BOOTSTRAP_RECOVERY_RULES = 5;
+
+/**
+ * Stated conventions first, then the most recently revalidated learned rules up to the cap.
+ *
+ * Ranked by when a rule was last seen to hold (`last_validated_at`, bumped each time the mistake
+ * recurs), not by a stored count of sightings: a count is a measurement (invariant 28), and a
+ * rule seen often last quarter matters less than one seen this morning.
+ */
+export function capRecoveryRules(items: MemoryItem[]): { served: MemoryItem[]; held: MemoryItem[] } {
+  const isRule = (i: MemoryItem) => i.source === 'deterministic' && i.tags.includes('recovery');
+  const rules = items.filter(isRule);
+  if (rules.length === 0) return { served: items, held: [] };
+  const seen = (i: MemoryItem) => i.last_validated_at ?? i.updated_at;
+  const ranked = [...rules].sort((a, b) => seen(b).localeCompare(seen(a)));
+  return {
+    served: [...items.filter((i) => !isRule(i)), ...ranked.slice(0, MAX_BOOTSTRAP_RECOVERY_RULES)],
+    held: ranked.slice(MAX_BOOTSTRAP_RECOVERY_RULES),
+  };
+}
+
 /** At most this many omitted ids are named in a query's marker; past it, the count is enough. */
 export const OMITTED_IDS_SHOWN = 4;
 
@@ -291,8 +320,16 @@ export class ContextBuilder {
       items.filter((i) => alwaysOnEligible(i, cb.min_bootstrap_confidence));
 
     for (const s of BOOTSTRAP_SECTIONS) {
-      const items = eligible(s.categories.flatMap((c) => this.retrieval.byCategory(c)));
-      sections.push(pack(s.title, items, cb.sections[s.budget], false, BOOTSTRAP_ITEM_CHARS));
+      const { served, held } = capRecoveryRules(eligible(s.categories.flatMap((c) => this.retrieval.byCategory(c))));
+      const section = pack(s.title, served, cb.sections[s.budget], false, BOOTSTRAP_ITEM_CHARS);
+      if (held.length > 0) {
+        section.dropped += held.length;
+        section.droppedIds = [...(section.droppedIds ?? []), ...held.map((i) => i.id)];
+        const cats = section.droppedCategories ?? [];
+        for (const i of held) if (!cats.includes(i.category)) cats.push(i.category);
+        section.droppedCategories = cats;
+      }
+      sections.push(section);
     }
 
     return this.finish(sections, cb.total_tokens - cb.reserve_for_retrieval);

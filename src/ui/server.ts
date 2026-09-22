@@ -118,7 +118,7 @@ async function handle(
         return;
 
       case '/api/benefits': {
-        const metrics = collectMetrics(manager.store, manager.config, null);
+        const metrics = collectMetrics(manager.store, manager.config, null, manager.projectRoot);
         send(res, 200, {
           root: manager.projectRoot,
           metrics,
@@ -182,7 +182,7 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function overview(manager: ContextManager) {
-  const metrics = collectMetrics(manager.store, manager.config, null);
+  const metrics = collectMetrics(manager.store, manager.config, null, manager.projectRoot);
   return {
     project: manager.config.project.name ?? null,
     root: manager.projectRoot,
