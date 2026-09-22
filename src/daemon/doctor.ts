@@ -603,7 +603,11 @@ function latencyChecks(manager: ContextManager): Check[] {
       name: 'hook latency',
       status: within ? 'ok' : 'warn',
       detail: `p50 ${stats.p50.toFixed(0)}ms, p95 ${stats.p95.toFixed(0)}ms against a ${budget}ms budget (n=${stats.count})`,
-      ...(within ? {} : { fix: 'raise limits.hook_latency_ms, or reduce what the hook ingests' }),
+      // Load first: samples taken while several agents build and test on this machine run an order
+      // of magnitude slower than the same hook on an idle one, and that is not a regression.
+      ...(within
+        ? {}
+        : { fix: 'check what else was running when these were measured; if the machine was idle, raise limits.hook_latency_ms or reduce what the hook ingests' }),
     },
   ];
 }

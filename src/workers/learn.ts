@@ -1,4 +1,4 @@
-import { collectEpisodes, renderEpisodeDigest, type EpisodeDigest } from '../core/episodes.js';
+import { collectEpisodes, EPISODE_WINDOW, renderEpisodeDigest, type EpisodeDigest } from '../core/episodes.js';
 import type { Config } from '../core/config.js';
 import { atLeast } from '../core/events.js';
 import type { AddItem, PatchViolation, StatePatch } from '../core/patch.js';
@@ -23,8 +23,17 @@ export const LEARN_TAG = 'learned';
 /** The lessons held already, shown to the model so it does not learn them twice. */
 const MAX_EXISTING_LESSONS = 40;
 
-/** Most events read per session to find episodes: bounded, and served by the session index. */
-const MAX_SESSION_EVENTS = 4000;
+/** Windows walked in one call before giving up on a session; the backstop, not the usual path. */
+const MAX_WINDOWS = 20;
+
+/**
+ * Events re-read at the start of the next window, so an episode split by a window boundary is seen
+ * whole by one of them. An episode spans at most `EPISODE_WINDOW` attempts, and an attempt is a
+ * call and its result at least - never more than half a window, or the walk would not advance.
+ */
+function overlap(windowSize: number): number {
+  return Math.min(EPISODE_WINDOW * 4, Math.floor(windowSize / 2));
+}
 
 export function watermarkKey(sessionId: string): string {
   return `learn_until:${sessionId}`;
@@ -55,15 +64,34 @@ export interface LearnInput {
 /**
  * The digest for one session, or null when it has no new episode - in which case no model is
  * called at all.
+ *
+ * A session longer than one window is walked forward from its watermark rather than read from its
+ * newest end: a real 5700-event session had its only episode in the older half, and the task saw
+ * "no new episodes" for it forever. A window with nothing in it is marked read (bar an overlap, so
+ * an episode straddling the boundary is not cut in two) and the next one is looked at - a store
+ * read each time, never a model call. `advance: false` keeps the walk in memory, for `--dry-run`.
  */
 export function buildLearnInput(
   store: ContextStore,
   config: Config,
   sessionId: string,
   root: string | null,
+  opts: { advance?: boolean } = {},
 ): LearnInput | null {
-  const events = store.sessionToolEvents(sessionId, MAX_SESSION_EVENTS);
-  const episodes = collectEpisodes(events, root, { after: learnWatermark(store, sessionId) });
+  const windowSize = config.learn.max_session_events;
+  let cursor = learnWatermark(store, sessionId);
+  let episodes: ReturnType<typeof collectEpisodes> = [];
+  for (let window = 0; window < MAX_WINDOWS; window += 1) {
+    const events = store.sessionToolEvents(sessionId, windowSize, { after: cursor });
+    episodes = collectEpisodes(events, root, { after: cursor });
+    if (episodes.length > 0) break;
+    // Short of the cap means the session's whole tail was read: there is nothing further on.
+    if (events.length < windowSize) return null;
+    const mark = events[Math.max(0, events.length - 1 - overlap(windowSize))]!.timestamp;
+    if (cursor != null && mark <= cursor) return null;
+    cursor = mark;
+    if (opts.advance !== false) advanceWatermark(store, sessionId, mark);
+  }
   if (episodes.length === 0) return null;
   const digest = renderEpisodeDigest(episodes, {
     maxEpisodes: config.learn.max_episodes,

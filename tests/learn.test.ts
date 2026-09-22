@@ -159,6 +159,43 @@ describe('episode digest', () => {
   );
 
   it(
+    'walks a session longer than one window instead of reading only its newest end',
+    withManager(
+      undefined,
+      (m) => {
+        // A real 5700-event session kept its only episode in the older half, and learn reported
+        // "no new episodes" for it every time: the window was taken from the newest end.
+        for (let n = 0; n < 10; n += 1) {
+          ingestEach(m, [call(`f${n}`, `git status ${n}`), result(`f${n}`, 'clean')]);
+        }
+        ingestEach(m, dockerEpisode());
+        const input = buildLearnInput(m.store, m.config, 's1', m.projectRoot);
+        expect(input).not.toBeNull();
+        expect(input!.digest.text).toContain('npm run test:api');
+        // The barren windows it walked past are marked read, so the next run starts after them.
+        expect(learnWatermark(m.store, 's1')).not.toBeNull();
+      },
+      { learn: { max_session_events: 12 } },
+    ),
+  );
+
+  it(
+    'leaves the watermark alone while only looking (--dry-run)',
+    withManager(
+      undefined,
+      (m) => {
+        ingestEach(m, [call('x1', 'ls /nowhere'), result('x1', 'ls: /nowhere: No such file or directory', true)]);
+        for (let n = 0; n < 6; n += 1) {
+          ingestEach(m, [call(`g${n}`, `git status ${n}`), result(`g${n}`, 'clean')]);
+        }
+        expect(buildLearnInput(m.store, m.config, 's1', m.projectRoot, { advance: false })).toBeNull();
+        expect(learnWatermark(m.store, 's1')).toBeNull();
+      },
+      { learn: { max_session_events: 8 } },
+    ),
+  );
+
+  it(
     'finds no episode in ordinary development, a flaky rerun, or scratch exploration',
     withManager(undefined, (m) => {
       ingestEach(m, [

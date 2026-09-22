@@ -240,6 +240,11 @@ export const ConfigSchema = z.object({
       max_episodes: z.number().int().positive().default(12),
       /** Estimated tokens per digest, cut at an episode boundary. */
       max_digest_tokens: z.number().int().positive().default(3000),
+      /**
+       * Events read per window while walking a session for episodes. A longer session is walked
+       * window by window from its watermark, so this bounds one store read, not what can be found.
+       */
+      max_session_events: z.number().int().positive().default(4000),
     })
     .default({}),
 

@@ -494,7 +494,7 @@ export class ContextManager {
         : this.store.sessionIdsWithEvents(1);
     const results: Array<{ sessionId: string; input: LearnInput | null; outcome: RunOutcome | null }> = [];
     for (const sessionId of sessions) {
-      const input = buildLearnInput(this.store, this.config, sessionId, this.loaded.root);
+      const input = buildLearnInput(this.store, this.config, sessionId, this.loaded.root, { advance: !opts.dryRun });
       if (!input || opts.dryRun) {
         results.push({ sessionId, input, outcome: null });
         continue;

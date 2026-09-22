@@ -309,20 +309,22 @@ export class ContextStore {
   }
 
   /**
-   * A whole session's tool traffic and agent messages, oldest first: what the `learn` task reads
-   * to find failure -> success episodes. The newest `limit` events, so a very long session is cut
-   * at its start rather than its end.
+   * A session's tool traffic and agent messages, oldest first: what the `learn` task reads to find
+   * failure -> success episodes. A window of `limit` events starting after `after`, not the newest
+   * `limit` - taking the newest silently hid an episode in a real 5700-event session, and the task
+   * consumes a session forward from its watermark anyway.
    */
-  sessionToolEvents(sessionId: string, limit = 4000): StoredEvent[] {
+  sessionToolEvents(sessionId: string, limit = 4000, opts: { after?: string | null } = {}): StoredEvent[] {
     const rows = this.db
       .prepare(
         `SELECT * FROM events
          WHERE session_id = ?
            AND type IN ('TOOL_CALL', 'FILE_CHANGED', 'TOOL_RESULT', 'ERROR_DETECTED', 'COMMAND_EXECUTED', 'ASSISTANT_MESSAGE')
-         ORDER BY ts DESC, ordinal DESC, rowid DESC LIMIT ?`,
+           AND (? IS NULL OR ts > ?)
+         ORDER BY ts ASC, ordinal ASC, rowid ASC LIMIT ?`,
       )
-      .all(sessionId, limit) as Array<Record<string, unknown>>;
-    return rows.map((r) => this.rowToEvent(r)).reverse();
+      .all(sessionId, opts.after ?? null, opts.after ?? null, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToEvent(r));
   }
 
   /** Every session that has events, newest first - `contextd learn --all` walks these. */
