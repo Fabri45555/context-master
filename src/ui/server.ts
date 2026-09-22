@@ -1,8 +1,11 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { collectBenefits } from '../metrics/benefits.js';
 import { collectMetrics } from '../metrics/index.js';
 import { MEMORY_CATEGORIES } from '../core/state.js';
+import { diagnose, worstStatus } from '../daemon/doctor.js';
 import type { ContextManager } from '../daemon/manager.js';
 import { renderPage } from './page.js';
 
@@ -28,8 +31,26 @@ export interface UiHandle {
   close(): Promise<void>;
 }
 
+/**
+ * The package version, for the header. Resolved relative to this module, which sits two levels
+ * below package.json both in src/ and in dist/. A missing file is a cosmetic loss, not an error.
+ */
+const APP_VERSION = ((): string => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
+      version?: unknown;
+    };
+    return typeof pkg.version === 'string' ? pkg.version : '';
+  } catch {
+    return '';
+  }
+})();
+
 /** Identifies the page this build serves; hashed without itself, which it then embeds. */
-const PAGE_VERSION = createHash('sha256').update(renderPage()).digest('hex').slice(0, 12);
+const PAGE_VERSION = createHash('sha256')
+  .update(renderPage('', APP_VERSION))
+  .digest('hex')
+  .slice(0, 12);
 
 export function startUi(manager: ContextManager, opts: UiOptions = {}): Promise<UiHandle> {
   const host = opts.host ?? '127.0.0.1';
@@ -74,7 +95,7 @@ async function handle(
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
         });
-        res.end(renderPage(PAGE_VERSION));
+        res.end(renderPage(PAGE_VERSION, APP_VERSION));
         return;
 
       case '/favicon.svg': {
@@ -103,6 +124,13 @@ async function handle(
           metrics,
           benefits: collectBenefits(manager.store, manager.config, metrics, manager.projectRoot),
         });
+        return;
+      }
+
+      case '/api/health': {
+        // The same checks as `contextd doctor`, so the pill and the CLI can never disagree.
+        const checks = diagnose(manager);
+        send(res, 200, { status: worstStatus(checks), checks });
         return;
       }
 
@@ -158,6 +186,7 @@ function overview(manager: ContextManager) {
   return {
     project: manager.config.project.name ?? null,
     root: manager.projectRoot,
+    root_display: shortenHome(manager.projectRoot),
     metrics,
     sessions: manager.store.listSessions(10),
     edges: manager.store.edgeCount(),
@@ -165,7 +194,15 @@ function overview(manager: ContextManager) {
     conflicts: manager.conflicts({ maxPairs: 50 }).length,
     never_retrieved_history: manager.store.neverRetrievedHistory(),
     machine: manager.config.limits,
+    working: manager.store.workingMemory(),
   };
+}
+
+/** The header has room for the project, not for the user's home directory. */
+export function shortenHome(path: string, home = homedir()): string {
+  if (!home) return path;
+  if (path === home) return '~';
+  return path.startsWith(home + '/') ? '~' + path.slice(home.length) : path;
 }
 
 function memoryPayload(manager: ContextManager, url: URL) {
